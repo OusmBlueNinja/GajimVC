@@ -163,13 +163,50 @@ def _candidate_to_xml(parent: ET.Element, candidate: IceCandidate) -> None:
     ET.SubElement(parent, qname(NS_ICE_UDP, "candidate"), attrs)
 
 
+def _description_owner_role(action: str) -> str:
+    """Return the Jingle role of the peer that generated this SDP description."""
+    return "responder" if action == "session-accept" else "initiator"
+
+
+def _opposite_role(role: str) -> str:
+    return "responder" if role == "initiator" else "initiator"
+
+
+def _direction_to_senders(direction: str, owner_role: str) -> str:
+    """Map local SDP direction to XEP-0166 senders for the description owner."""
+    if direction == "sendonly":
+        return owner_role
+    if direction == "recvonly":
+        return _opposite_role(owner_role)
+    if direction == "inactive":
+        return "none"
+    return "both"
+
+
+def _senders_to_direction(senders: str, owner_role: str) -> str:
+    """Map XEP-0166 senders back to SDP direction for the description owner."""
+    if senders == "none":
+        return "inactive"
+    if senders == owner_role:
+        return "sendonly"
+    if senders == _opposite_role(owner_role):
+        return "recvonly"
+    return "sendrecv"
+
+
 def _media_to_content(
-    section: MediaSection, creator: str, *, include_description: bool = True
+    section: MediaSection,
+    creator: str,
+    *,
+    owner_role: str,
+    include_description: bool = True,
 ) -> ET.Element:
-    content = ET.Element(
-        qname(NS_JINGLE, "content"),
-        {"creator": creator, "name": section.mid, "senders": "both"},
-    )
+    attrs = {"creator": creator, "name": section.mid}
+    # transport-info identifies an existing content and carries no RTP
+    # description. Do not restate a possibly stale senders value there.
+    if include_description:
+        attrs["senders"] = _direction_to_senders(section.direction, owner_role)
+    content = ET.Element(qname(NS_JINGLE, "content"), attrs)
     if include_description:
         description = ET.SubElement(
             content, qname(NS_RTP, "description"), {"media": section.media}
@@ -225,11 +262,13 @@ def build_jingle(
             )
             for mid in mids:
                 ET.SubElement(group, qname(NS_GROUPING, "content"), {"name": mid})
+        owner_role = _description_owner_role(action)
         for section in description.media:
             root.append(
                 _media_to_content(
                     section,
                     creator,
+                    owner_role=owner_role,
                     include_description=action != "transport-info",
                 )
             )
@@ -290,6 +329,7 @@ def parse_jingle(xml_or_element: str | ET.Element) -> JingleEvent | None:
     if not action or not sid:
         return None
 
+    owner_role = _description_owner_role(action)
     sections: list[MediaSection] = []
     for content in root.findall(qname(NS_JINGLE, "content")):
         description = content.find(qname(NS_RTP, "description"))
@@ -308,6 +348,9 @@ def parse_jingle(xml_or_element: str | ET.Element) -> JingleEvent | None:
             codecs=[],
         )
         if description is not None:
+            section.direction = _senders_to_direction(
+                content.attrib.get("senders", "both"), owner_role
+            )
             section.codecs = [
                 _codec_from_xml(item)
                 for item in description.findall(qname(NS_RTP, "payload-type"))

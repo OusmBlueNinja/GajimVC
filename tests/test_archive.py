@@ -20,4 +20,5 @@ def test_build_archive_is_gajim_installable(tmp_path: Path):
             archive.read("gajim_calls/plugin-manifest.json").decode()
         )
         assert manifest["short_name"] == "gajim_calls"
-        assert manifest["version"] == "0.1.0"
+        assert manifest["version"] == "0.1.1"
+        assert manifest["requirements"] == ["gajim>=2.4.2,<2.6.0"]

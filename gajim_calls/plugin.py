@@ -12,9 +12,10 @@ from gajim.gtk.alert import InformationAlertDialog
 from gajim.gtk.message_actions_box import MessageActionsBox
 from gajim.plugins import GajimPlugin
 
+from . import controller as controller_module
 from .controller import CallController
 from .gtk.config import ConfigDialog
-from .media import probe_runtime
+from .media_engine import WebRTCMediaEngine, probe_runtime
 from . import module
 
 log = logging.getLogger("gajim.p.gajim_calls")
@@ -30,6 +31,11 @@ class GajimCallsPlugin(GajimPlugin):
             "Audio and video calls using XMPP Jingle and GStreamer WebRTC"
         )
         self.config_dialog = partial(ConfigDialog, self)
+
+        # controller.py historically imported the media class directly. Keep
+        # its public surface stable while selecting the hardened implementation
+        # that fixes current GStreamer promise/BUNDLE/ICE interoperability.
+        controller_module.WebRTCMediaEngine = WebRTCMediaEngine
         self.controller = CallController(self)
         module.set_controller(self.controller)
         self.modules = [module]

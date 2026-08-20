@@ -9,12 +9,12 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import gi
+import gi  # noqa: E402
 
 gi.require_version("GLib", "2.0")
-from gi.repository import GLib
+from gi.repository import GLib  # noqa: E402
 
-from gajim_calls.media import WebRTCMediaEngine, probe_runtime
+from gajim_calls.media import WebRTCMediaEngine, probe_runtime  # noqa: E402
 
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")

@@ -158,8 +158,6 @@ def _candidate_to_xml(parent: ET.Element, candidate: IceCandidate) -> None:
         attrs["rel-addr"] = candidate.rel_addr
     if candidate.rel_port is not None:
         attrs["rel-port"] = str(candidate.rel_port)
-    if candidate.tcp_type:
-        attrs["tcptype"] = candidate.tcp_type
     ET.SubElement(parent, qname(NS_ICE_UDP, "candidate"), attrs)
 
 
@@ -232,6 +230,8 @@ def _media_to_content(
         )
         fp.text = section.fingerprint.value
     for candidate in section.candidates:
+        if candidate.protocol.lower() != "udp":
+            continue
         _candidate_to_xml(transport, candidate)
     return content
 
@@ -311,7 +311,7 @@ def _candidate_from_xml(node: ET.Element) -> IceCandidate:
         type=node.attrib.get("type", "host"),
         rel_addr=node.attrib.get("rel-addr"),
         rel_port=int(node.attrib["rel-port"]) if node.attrib.get("rel-port") else None,
-        tcp_type=node.attrib.get("tcptype"),
+        tcp_type=None,
         generation=int(node.attrib.get("generation", "0")),
         network=int(node.attrib.get("network", "0")),
     )
@@ -371,7 +371,9 @@ def parse_jingle(xml_or_element: str | ET.Element) -> JingleEvent | None:
             section.candidates = [
                 _candidate_from_xml(item)
                 for item in transport.findall(qname(NS_ICE_UDP, "candidate"))
-                if item.attrib.get("ip") and item.attrib.get("port")
+                if item.attrib.get("ip")
+                and item.attrib.get("port")
+                and item.attrib.get("protocol", "udp").lower() == "udp"
             ]
         sections.append(section)
 

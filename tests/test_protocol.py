@@ -68,6 +68,62 @@ def test_jingle_round_trip():
     assert event.description.media[0].candidates[0].port == 50000
 
 
+def test_ice_udp_transport_filters_non_udp_candidates_on_send():
+    desc = description()
+    desc.media[0].candidates.append(
+        IceCandidate(
+            "2",
+            1,
+            "tcp",
+            1694498815,
+            "10.0.0.2",
+            9,
+            "host",
+            tcp_type="active",
+        )
+    )
+
+    event = parse_jingle(
+        xml_text(
+            build_jingle(
+                "session-initiate",
+                "udp-only",
+                initiator="a@example.test/desktop",
+                responder="b@example.test/phone",
+                description=desc,
+            )
+        )
+    )
+
+    assert event is not None
+    candidates = event.description.media[0].candidates
+    assert [(item.protocol, item.port) for item in candidates] == [("udp", 50000)]
+
+
+def test_ice_udp_transport_ignores_non_udp_candidates_on_receive():
+    xml = """
+    <jingle xmlns='urn:xmpp:jingle:1' action='transport-info' sid='udp-only'
+            initiator='a@example.test/desktop' responder='b@example.test/phone'>
+      <content creator='initiator' name='audio'>
+        <transport xmlns='urn:xmpp:jingle:transports:ice-udp:1' ufrag='u' pwd='p'>
+          <candidate component='1' foundation='1' generation='0' id='udp'
+                     ip='10.0.0.2' network='0' port='50000' priority='2130706431'
+                     protocol='udp' type='host'/>
+          <candidate component='1' foundation='2' generation='0' id='tcp'
+                     ip='10.0.0.2' network='0' port='9' priority='1694498815'
+                     protocol='tcp' type='host' tcptype='active'/>
+        </transport>
+      </content>
+    </jingle>
+    """
+
+    event = parse_jingle(xml)
+
+    assert event is not None
+    candidates = event.description.media[0].candidates
+    assert [(item.protocol, item.port) for item in candidates] == [("udp", 50000)]
+
+
 def test_audio_only_bundle_survives_sdp_jingle_sdp_round_trip():
     original_sdp = """v=0
  o=- 1 1 IN IP4 0.0.0.0

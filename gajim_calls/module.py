@@ -34,6 +34,31 @@ def set_controller(controller: Any) -> None:
     _controller = controller
 
 
+def _log_candidates(prefix: str, description: SessionDescription) -> None:
+    total = sum(len(section.candidates) for section in description.media)
+    log.info("%s ICE candidates=%d", prefix, total)
+    for section in description.media:
+        log.info(
+            "%s ICE mid=%s ufrag=%s pwd=%s candidates=%d",
+            prefix,
+            section.mid,
+            section.ice_ufrag,
+            "set" if section.ice_pwd else "missing",
+            len(section.candidates),
+        )
+        for candidate in section.candidates:
+            log.info(
+                "%s ICE candidate mid=%s type=%s protocol=%s ip=%s port=%s component=%s",
+                prefix,
+                section.mid,
+                candidate.type,
+                candidate.protocol,
+                candidate.ip,
+                candidate.port,
+                candidate.component,
+            )
+
+
 class CallsModule(BaseModule):
     def __init__(self, client) -> None:
         BaseModule.__init__(self, client, plugin=True)
@@ -102,6 +127,7 @@ class CallsModule(BaseModule):
             from_jid,
             ",".join(section.media for section in event.description.media) or "none",
         )
+        _log_candidates("RX", event.description)
 
         # Jingle actions are IQ-set and must be acknowledged even when the user
         # has not answered the ringing UI yet.
@@ -174,6 +200,8 @@ class CallsModule(BaseModule):
         )
         iq.addChild(node=Node(node=xml_text(payload)))
         log.info("TX Jingle %s sid=%s to=%s", action, sid, to_jid)
+        if description is not None:
+            _log_candidates("TX", description)
         self._send(iq)
 
 

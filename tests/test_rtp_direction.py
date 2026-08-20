@@ -56,7 +56,7 @@ def test_jingle_senders_preserves_sdp_direction(
 
 
 def test_missing_jingle_senders_defaults_to_sendrecv() -> None:
-    xml = f"""
+    xml = """
     <jingle xmlns='urn:xmpp:jingle:1' action='session-initiate' sid='default-direction'
             initiator='a@example.test/Desktop' responder='b@example.test/Phone'>
       <content creator='initiator' name='audio'>

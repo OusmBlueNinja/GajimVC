@@ -20,9 +20,11 @@ Jingle signaling on the wire.
 - Incoming call UI, accept/decline, hang-up, and embedded remote video when
   `gtk4paintablesink` is available
 - Optional STUN and TURN configuration
-- Headless unit tests for call state, SDP/Jingle conversion, ICE parsing, and
-  Gajim archive packaging
-- Gitea Actions build that produces a directly installable plugin artifact
+- Headless unit tests for call state, SDP/Jingle conversion, ICE parsing, manual
+  archive packaging, and updater-repository packaging
+- Gitea Actions CI with automatic versioned Gitea releases
+- Gajim-compatible `package_index.json` repository feed on the
+  `plugin-repository` branch
 
 ## Why this plugin exists
 
@@ -35,28 +37,90 @@ device capture/playback.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design.
 
-## Install from a Gitea Actions artifact
+## Releases
 
-1. Open **Actions** in this repository.
-2. Open the latest successful **Build Gajim Calls** run.
-3. Download the `gajim-calls` artifact.
-4. In Gajim, open **Preferences → Plugins**.
-5. Choose **Install from File / Install from ZIP** and select the downloaded
-   artifact ZIP.
-6. Enable **Gajim Calls**.
+`gajim_calls/plugin-manifest.json` is the source of truth for the plugin
+version. After CI passes on `main`, the Gitea workflow checks that version:
 
-The workflow deliberately uploads a directory whose only top-level entry is
-`gajim_calls/`. That matches Gajim 2.4's archive installer, so the downloaded
-Actions artifact itself has the correct plugin layout.
+- If `v<version>` has never been published, the workflow creates the tag and
+  Gitea release automatically.
+- If that exact version is already tagged at the current commit, rerunning the
+  workflow repairs/replaces generated release assets.
+- If the version is already tagged at an older commit, the workflow refuses to
+  silently republish changed code under the same version. Bump the manifest
+  version first.
 
-For local builds:
+Every release contains:
+
+- `gajim_calls-<version>.zip` — **manual install** archive for Gajim's
+  **Install from File / Install from ZIP** path.
+- `gajim_calls_<version>.zip` — **repository updater** package. Its
+  `plugin-manifest.json` is at the ZIP root, as Gajim's repository downloader
+  expects.
+- `package_index.json` and `images.zip` — Gajim plugin repository metadata.
+
+For normal installation, download `gajim_calls-<version>.zip` from the latest
+release, then open **Preferences → Plugins → Install from File / Install from
+ZIP** and enable **Gajim Calls**.
+
+## Gajim plugin auto-update repository
+
+The release job also publishes/updates a dedicated `plugin-repository` branch.
+Its root has this layout:
+
+```text
+package_index.json
+images.zip
+gajim_calls/
+  gajim_calls_<version>.zip
+```
+
+This matches Gajim's plugin repository protocol. New versions are retained on
+the branch and `package_index.json` is regenerated from every package present.
+
+The repository base URL, when it is anonymously reachable, is:
+
+```text
+https://dock-it.dev/Deauth/gajim-calls/raw/branch/plugin-repository
+```
+
+**Important:** this Gitea repository is currently private. Stock Gajim does not
+send your Gitea credentials when downloading a plugin repository, so the feed
+must be exposed anonymously (for example by making this repository/feed public)
+before a normal Gajim client can fetch it.
+
+Also, stock Gajim obtains its default plugin-repository URL from Gajim's own
+update service. For completely automatic discovery in an unmodified Gajim
+installation, Gajim Calls must be included in the official Gajim plugin
+repository. The generated branch uses the same package format and is ready to
+serve directly in builds/configurations that point Gajim at this repository.
+
+## Build locally
+
+Manual-install ZIP:
 
 ```bash
 python scripts/build_plugin.py --output dist/gajim_calls.zip
 python scripts/verify_archive.py dist/gajim_calls.zip
 ```
 
-Then install `dist/gajim_calls.zip` in Gajim.
+Updater repository:
+
+```bash
+python scripts/build_repository.py --output-dir dist/repository
+python scripts/verify_repository.py dist/repository
+```
+
+The two ZIP layouts are intentionally different. Do not use the updater ZIP
+with Gajim's manual ZIP installer and do not add a `gajim_calls/` wrapper to the
+repository updater ZIP.
+
+## Install from a Gitea Actions artifact
+
+CI still publishes a directly installable `gajim-calls` Actions artifact for
+every successful build. Open the latest successful **Build and Release Gajim
+Calls** run, download that artifact, and install the downloaded ZIP through
+Gajim's plugin manager.
 
 ## Linux media dependencies
 
@@ -114,13 +178,15 @@ Conversations-family and Dino-family clients.
 
 ```bash
 python -m pytest -q
-python -m compileall -q gajim_calls
+python -m compileall -q gajim_calls scripts
 python scripts/build_plugin.py --output dist/gajim_calls.zip
 python scripts/verify_archive.py dist/gajim_calls.zip
+python scripts/build_repository.py --output-dir dist/repository
+python scripts/verify_repository.py dist/repository
 ```
 
-CI also runs Ruff for Python errors and uploads the installable artifact only
-after tests and archive validation pass.
+CI also runs Ruff and only publishes a release after linting, unit tests,
+compilation, and both package-layout verifiers pass.
 
 ## Security
 

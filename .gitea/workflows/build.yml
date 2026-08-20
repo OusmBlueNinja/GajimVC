@@ -1,9 +1,11 @@
-name: Build Gajim Calls
+name: Build and Release Gajim Calls
 
 on:
   push:
   pull_request:
   workflow_dispatch:
+
+permissions: read-all
 
 jobs:
   test-and-package:
@@ -27,22 +29,229 @@ jobs:
         run: python -m pytest -q
 
       - name: Compile Python
-        run: python -m compileall -q gajim_calls
+        run: python -m compileall -q gajim_calls scripts
 
-      - name: Build installable Gajim archive
+      - name: Build manual-install archive
         run: python scripts/build_plugin.py --output dist/gajim_calls.zip
 
-      - name: Verify archive layout
+      - name: Verify manual-install archive
         run: python scripts/verify_archive.py dist/gajim_calls.zip
 
-      - name: Stage directly installable artifact
+      - name: Build Gajim updater repository
+        run: python scripts/build_repository.py --output-dir dist/repository
+
+      - name: Verify Gajim updater repository
+        run: python scripts/verify_repository.py dist/repository
+
+      - name: Stage directly installable Actions artifact
         run: |
           mkdir -p dist/artifact
           unzip -q dist/gajim_calls.zip -d dist/artifact
 
-      - name: Upload plugin archive
+      - name: Upload plugin artifact
         uses: actions/upload-artifact@v3
         with:
           name: gajim-calls
           path: dist/artifact/
           if-no-files-found: error
+
+  release:
+    if: ${{ gitea.event_name == 'push' && gitea.ref == 'refs/heads/main' }}
+    needs: test-and-package
+    runs-on: ubuntu-latest
+    permissions:
+      code: write
+      releases: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Read release version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(python - <<'PY'
+          import json
+          from pathlib import Path
+
+          manifest = json.loads(Path("gajim_calls/plugin-manifest.json").read_text(encoding="utf-8"))
+          version = str(manifest["version"])
+          if not version or any(char.isspace() or char in "/\\" for char in version):
+              raise SystemExit(f"Unsafe plugin version: {version!r}")
+          print(version)
+          PY
+          )"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Decide whether this version needs publishing
+        id: publish
+        shell: bash
+        env:
+          GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git fetch --tags --force
+
+          TAG_SHA="$(git rev-list -n 1 "$TAG" 2>/dev/null || true)"
+          if [ -n "$TAG_SHA" ] && [ "$TAG_SHA" != "$GITHUB_SHA" ]; then
+            echo "Version $TAG is already tagged at $TAG_SHA; not republishing changed code under the same version."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "existing=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          STATUS="$(curl -sS -o /tmp/release.json -w '%{http_code}' \
+            -H "Authorization: token $GITEA_TOKEN" \
+            -H "Accept: application/json" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/tags/$TAG")"
+
+          case "$STATUS" in
+            200)
+              echo "Release $TAG already exists for this commit; repairing/replacing its generated assets."
+              echo "publish=true" >> "$GITHUB_OUTPUT"
+              echo "existing=true" >> "$GITHUB_OUTPUT"
+              ;;
+            404)
+              echo "New plugin version $TAG will be published."
+              echo "publish=true" >> "$GITHUB_OUTPUT"
+              echo "existing=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              cat /tmp/release.json || true
+              echo "Unexpected Gitea API status: $STATUS" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Build release files
+        if: ${{ steps.publish.outputs.publish == 'true' }}
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          python scripts/build_plugin.py --output "dist/gajim_calls-$VERSION.zip"
+          python scripts/verify_archive.py "dist/gajim_calls-$VERSION.zip"
+          python scripts/build_repository.py --output-dir dist/repository
+          python scripts/verify_repository.py dist/repository
+
+      - name: Create or reuse Gitea release
+        if: ${{ steps.publish.outputs.publish == 'true' }}
+        id: release
+        shell: bash
+        env:
+          GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+          EXISTING: ${{ steps.publish.outputs.existing }}
+        run: |
+          set -euo pipefail
+          if [ "$EXISTING" = "true" ]; then
+            cp /tmp/release.json /tmp/published-release.json
+          else
+            TAG="$TAG" VERSION="$VERSION" SHA="$GITHUB_SHA" python - <<'PY' > /tmp/release-payload.json
+          import json
+          import os
+
+          json.dump(
+              {
+                  "tag_name": os.environ["TAG"],
+                  "target_commitish": os.environ["SHA"],
+                  "name": f"Gajim Calls {os.environ['TAG']}",
+                  "body": "Automated Gajim Calls release. Includes a manual-install ZIP and Gajim plugin-repository files.",
+                  "draft": False,
+                  "prerelease": False,
+              },
+              __import__("sys").stdout,
+          )
+          PY
+            curl -fsS -X POST \
+              -H "Authorization: token $GITEA_TOKEN" \
+              -H "Accept: application/json" \
+              -H "Content-Type: application/json" \
+              --data-binary @/tmp/release-payload.json \
+              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases" \
+              > /tmp/published-release.json
+          fi
+
+          RELEASE_ID="$(python -c 'import json; print(json.load(open("/tmp/published-release.json"))["id"])')"
+          echo "id=$RELEASE_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Upload release assets
+        if: ${{ steps.publish.outputs.publish == 'true' }}
+        shell: bash
+        env:
+          GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
+          RELEASE_ID: ${{ steps.release.outputs.id }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          UPDATER_ZIP="dist/repository/gajim_calls/gajim_calls_${VERSION}.zip"
+          ASSETS=(
+            "dist/gajim_calls-${VERSION}.zip"
+            "$UPDATER_ZIP"
+            "dist/repository/package_index.json"
+            "dist/repository/images.zip"
+          )
+
+          for ASSET in "${ASSETS[@]}"; do
+            NAME="$(basename "$ASSET")"
+            EXISTING_ID="$(curl -fsS \
+              -H "Authorization: token $GITEA_TOKEN" \
+              -H "Accept: application/json" \
+              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets" \
+              | python -c 'import json, sys; name=sys.argv[1]; print(next((str(a["id"]) for a in json.load(sys.stdin) if a["name"] == name), ""))' "$NAME")"
+
+            if [ -n "$EXISTING_ID" ]; then
+              curl -fsS -X DELETE \
+                -H "Authorization: token $GITEA_TOKEN" \
+                "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets/$EXISTING_ID"
+            fi
+
+            curl -fsS -X POST \
+              -H "Authorization: token $GITEA_TOKEN" \
+              -H "Accept: application/json" \
+              -F "attachment=@$ASSET" \
+              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?name=$NAME" \
+              > /dev/null
+          done
+
+      - name: Publish Gajim plugin repository branch
+        if: ${{ steps.publish.outputs.publish == 'true' }}
+        shell: bash
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          PUBLISH_DIR="$(mktemp -d)"
+
+          if git ls-remote --exit-code --heads origin plugin-repository >/dev/null 2>&1; then
+            git fetch origin plugin-repository:refs/remotes/origin/plugin-repository
+            git worktree add -B plugin-repository "$PUBLISH_DIR" origin/plugin-repository
+          else
+            git worktree add --detach "$PUBLISH_DIR" "$GITHUB_SHA"
+            git -C "$PUBLISH_DIR" checkout --orphan plugin-repository
+            git -C "$PUBLISH_DIR" rm -rf . >/dev/null 2>&1 || true
+          fi
+
+          python scripts/build_repository.py --output-dir "$PUBLISH_DIR"
+          python scripts/verify_repository.py "$PUBLISH_DIR"
+
+          git -C "$PUBLISH_DIR" config user.name "gitea-actions"
+          git -C "$PUBLISH_DIR" config user.email "actions@localhost"
+          git -C "$PUBLISH_DIR" add -A
+
+          if ! git -C "$PUBLISH_DIR" diff --cached --quiet; then
+            git -C "$PUBLISH_DIR" commit -m "Publish Gajim Calls $TAG"
+            git -C "$PUBLISH_DIR" push origin HEAD:plugin-repository
+          fi

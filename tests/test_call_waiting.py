@@ -316,6 +316,45 @@ def test_declining_waiting_call_keeps_current_media_and_state(monkeypatch):
     assert controller.plugin.active[-1] == (True, True)
 
 
+def test_closing_waiting_window_declines_waiting_and_keeps_active_call(monkeypatch):
+    controller = connected_controller(monkeypatch)
+    old_context = controller.context
+    old_media = controller.media
+    controller.handle_jmi(
+        "acc",
+        "second@example.test/Phone",
+        JMIEvent("propose", "waiting", media=("audio",)),
+    )
+
+    controller.close_call_window()
+
+    assert controller.context is old_context
+    assert controller.context is not None
+    assert controller.context.state is CallState.CONNECTED
+    assert controller.media is old_media
+    assert old_media is not None and not old_media.closed
+    assert controller.waiting_context is None
+    assert controller.module.jmi[-1]["action"] == "reject"
+    assert controller.module.jmi[-1]["sid"] == "waiting"
+    assert controller.module.jmi[-1]["reason"] == "busy"
+    assert controller.plugin.active[-1] == (True, True)
+
+
+def test_closing_normal_call_window_still_hangs_up_current_call(monkeypatch):
+    controller = connected_controller(monkeypatch)
+    old_media = controller.media
+
+    controller.close_call_window()
+
+    assert controller.context is not None
+    assert controller.context.state is CallState.ENDED
+    assert old_media is not None and old_media.closed
+    assert any(
+        item["action"] == "session-terminate" and item["sid"] == "active"
+        for item in controller.module.jingle
+    )
+
+
 def test_direct_jingle_waiting_offer_is_owned_and_preserved(monkeypatch):
     controller = connected_controller(monkeypatch)
     offer = description()

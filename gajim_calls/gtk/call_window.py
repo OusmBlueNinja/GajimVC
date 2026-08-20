@@ -303,8 +303,14 @@ class CallWindow(Gtk.ApplicationWindow):
 
     def _on_close(self, _window) -> bool:
         self.set_visible(False)
-        self._controller.plugin.set_call_active(False)
-        self._queue(self._controller.hangup)
+        # A call-waiting controller can be displaying a second incoming call
+        # while its main context/media still belong to the connected call. Let
+        # the controller decide which visible call should be dismissed rather
+        # than blindly hanging up the main context here.
+        callback = getattr(
+            self._controller, "close_call_window", self._controller.hangup
+        )
+        self._queue(callback)
         return True
 
     def show_outgoing(self, peer: str, video: bool) -> None:

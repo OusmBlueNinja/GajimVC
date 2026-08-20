@@ -94,8 +94,6 @@ def with_call_waiting(base: type[T]) -> type[T]:
                     sid,
                 )
             except (ImportError, ModuleNotFoundError):
-                # Headless unit tests deliberately run without PyGObject. They
-                # invoke _on_waiting_timeout synchronously instead.
                 self._waiting_timeout_id = None
 
         def _on_waiting_timeout(self, sid: str) -> bool:
@@ -149,8 +147,6 @@ def with_call_waiting(base: type[T]) -> type[T]:
 
             self._start_waiting_alert(waiting)
             self._get_window().show_incoming(waiting.peer_bare, waiting.has_video)
-            # show_incoming() marks the toolbar as a not-yet-connected call.
-            # The original connected call is still live until Accept is clicked.
             self._restore_active_indicator()
             self._arm_waiting_timeout(sid)
             log.info("Incoming call waiting sid=%s peer=%s", sid, waiting.peer_bare)
@@ -203,6 +199,20 @@ def with_call_waiting(base: type[T]) -> type[T]:
                     reason,
                 )
             self._clear_waiting()
+
+        def close_call_window(self) -> None:
+            """Dismiss the call represented by the visible call window.
+
+            While call waiting is active, the window belongs to the waiting
+            caller even though ``context`` and ``media`` intentionally remain
+            attached to the connected call. Closing that window is therefore
+            equivalent to declining the waiting call, not hanging up the active
+            one.
+            """
+            if self._waiting_context is not None:
+                self._decline_waiting()
+                return
+            super().hangup()
 
         def _reject_extra_call(
             self,
@@ -390,9 +400,6 @@ def with_call_waiting(base: type[T]) -> type[T]:
             super()._finish_local(state, hide=hide)
             if waiting is not None:
                 self._cancel_waiting_timeout()
-                # The active call ended while another caller was waiting. Make
-                # that call the normal ringing context instead of leaving a
-                # special waiting state behind.
                 self.context = waiting
                 self._pending_offer = waiting_offer
                 self._waiting_context = None

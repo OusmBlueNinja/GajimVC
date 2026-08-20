@@ -229,3 +229,32 @@ def test_failure_jmi_finish_reason_round_trip():
     assert parsed is not None
     assert parsed.action == "finish"
     assert parsed.reason == "connectivity-error"
+
+
+def test_unknown_jingle_action_is_rejected_before_it_can_be_claimed():
+    parsed = parse_jingle(
+        """
+        <jingle xmlns='urn:xmpp:jingle:1' action='definitely-not-jingle' sid='owned-call'>
+          <content creator='initiator' name='audio'>
+            <description xmlns='urn:xmpp:jingle:apps:rtp:1' media='audio'/>
+          </content>
+        </jingle>
+        """
+    )
+
+    assert parsed is None
+
+
+def test_jingle_action_validation_keeps_standard_call_actions_usable():
+    for action in (
+        "session-initiate",
+        "session-accept",
+        "transport-info",
+        "session-terminate",
+    ):
+        parsed = parse_jingle(
+            f"<jingle xmlns='urn:xmpp:jingle:1' action='{action}' sid='call'/>"
+        )
+        assert parsed is not None
+        assert parsed.action == action
+        assert parsed.sid == "call"

@@ -33,6 +33,25 @@ for prefix, namespace in (
     ET.register_namespace(prefix, namespace)
 
 
+_JINGLE_ACTIONS = {
+    "content-accept",
+    "content-add",
+    "content-modify",
+    "content-reject",
+    "content-remove",
+    "description-info",
+    "security-info",
+    "session-accept",
+    "session-info",
+    "session-initiate",
+    "session-terminate",
+    "transport-accept",
+    "transport-info",
+    "transport-reject",
+    "transport-replace",
+}
+
+
 def qname(namespace: str, local: str) -> str:
     return f"{{{namespace}}}{local}"
 
@@ -326,7 +345,7 @@ def parse_jingle(xml_or_element: str | ET.Element) -> JingleEvent | None:
 
     action = root.attrib.get("action", "")
     sid = root.attrib.get("sid", "")
-    if not action or not sid:
+    if action not in _JINGLE_ACTIONS or not sid:
         return None
 
     owner_role = _description_owner_role(action)

@@ -47,6 +47,13 @@ class _HardenedWebRTCMediaEngine(_BaseWebRTCMediaEngine):
         if remote_video is not None:
             kwargs["on_remote_video"] = lambda paintable: _idle(remote_video, paintable)
 
+        self._candidate_stats: dict[str, dict[str, int]] = {
+            "local": {},
+            "remote": {},
+        }
+        self._stun_configured = bool(kwargs.get("stun_server"))
+        self._turn_configured = bool(kwargs.get("turn_server"))
+
         super().__init__(*args, **kwargs)
 
         # BALANCED is not implemented by some current webrtcbin builds.
@@ -78,23 +85,39 @@ class _HardenedWebRTCMediaEngine(_BaseWebRTCMediaEngine):
         if self._on_state is not None:
             self._dispatch(self._on_state, text)
 
+    @staticmethod
+    def _candidate_key(candidate: str) -> str:
+        try:
+            parsed = IceCandidate.from_sdp(candidate)
+        except (ValueError, TypeError):
+            return "invalid"
+        return f"{parsed.type}/{parsed.protocol}"
+
+    def _record_candidate(self, side: str, candidate: str) -> None:
+        key = self._candidate_key(candidate)
+        stats = self._candidate_stats[side]
+        stats[key] = stats.get(key, 0) + 1
+
+    def _format_candidate_stats(self, side: str) -> str:
+        stats = self._candidate_stats[side]
+        if not stats:
+            return "none"
+        return ",".join(f"{key}={stats[key]}" for key in sorted(stats))
+
     def _fail(self, reason: str) -> None:
         if self._failed:
             return
         self._failed = True
         details = (
-            f"{reason}; local ICE candidates={self._local_candidate_count}, "
-            f"remote ICE candidates={self._remote_candidate_count}"
+            f"{reason}; local ICE candidates={self._local_candidate_count} "
+            f"({self._format_candidate_stats('local')}), "
+            f"remote ICE candidates={self._remote_candidate_count} "
+            f"({self._format_candidate_stats('remote')}), "
+            f"STUN={'yes' if self._stun_configured else 'no'}, "
+            f"TURN={'yes' if self._turn_configured else 'no'}"
         )
         log.error("WebRTC failure: %s", details)
         self._dispatch(self._on_failed, details)
-
-    @staticmethod
-    def _is_udp_candidate(candidate: str) -> bool:
-        try:
-            return IceCandidate.from_sdp(candidate).protocol == "udp"
-        except (ValueError, TypeError):
-            return False
 
     def _on_local_offer_set(self, promise, _offer, _notify) -> None:
         error = self._reply_error(promise.get_reply())
@@ -132,27 +155,17 @@ class _HardenedWebRTCMediaEngine(_BaseWebRTCMediaEngine):
             self._fail(f"WebRTC connection state: {name}")
 
     def _on_local_ice(
-        self, _element, mline_index: int, candidate: str
+        self, element, mline_index: int, candidate: str
     ) -> None:
-        # XEP-0176 is ICE-UDP. Ignore ICE-TCP candidates emitted by libnice.
-        if not self._is_udp_candidate(candidate):
-            log.debug("Ignoring non-UDP local ICE candidate: %s", candidate)
-            return
-
-        self._local_candidate_count += 1
-        local = self.webrtc.get_property("local-description")
-        mid = str(mline_index)
-        if local is not None:
-            parsed = parse_sdp(local.sdp.as_text())
-            if mline_index < len(parsed.media):
-                mid = parsed.media[mline_index].mid
-        log.info("TX ICE candidate mid=%s %s", mid, candidate)
-        self._dispatch(self._on_ice_candidate, mid, candidate)
+        # Conversations/libwebrtc can exchange UDP and TCP ICE candidates in
+        # Jingle. The previous compatibility layer discarded every TCP
+        # candidate, which removed viable host/relay paths on restrictive
+        # networks before ICE could test them.
+        self._record_candidate("local", candidate)
+        super()._on_local_ice(element, mline_index, candidate)
 
     def add_remote_candidate(self, mid: str, candidate: str) -> None:
-        if not self._is_udp_candidate(candidate):
-            log.debug("Ignoring non-UDP remote ICE candidate: %s", candidate)
-            return
+        self._record_candidate("remote", candidate)
         super().add_remote_candidate(mid, candidate)
 
     def _on_decoded_pad(self, decode, pad) -> None:

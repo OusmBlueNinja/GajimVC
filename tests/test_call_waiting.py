@@ -131,6 +131,7 @@ def runtime_base(monkeypatch):
             self.window = Window()
             self.module = Module()
             self.cancelled_timeouts = 0
+            self.media_starts: list[tuple[bool, SessionDescription | None]] = []
 
         def _module(self, account: str):
             assert account == "acc"
@@ -157,6 +158,15 @@ def runtime_base(monkeypatch):
                 and context.sid == sid
                 and context.peer_full == sender
             )
+
+        def _start_media(
+            self,
+            *,
+            offerer: bool,
+            remote_offer: SessionDescription | None = None,
+        ) -> None:
+            self.media_starts.append((offerer, remote_offer))
+            self.media = Media()
 
         def _finish_local(self, state: CallState, *, hide: bool = True) -> None:
             if self.media is not None:
@@ -289,6 +299,7 @@ def test_direct_jingle_waiting_offer_is_owned_and_preserved(monkeypatch):
     assert controller.context is not None
     assert controller.context.sid == "direct-waiting"
     assert controller.context.state is CallState.NEGOTIATING
+    assert controller.media_starts[-1] == (False, offer)
 
 
 def test_third_incoming_call_is_rejected_busy(monkeypatch):

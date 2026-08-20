@@ -6,25 +6,36 @@ from .protocol import JingleEvent
 
 
 def is_ice_transport_info(event: JingleEvent) -> bool:
-    """Return True for trickled ICE-UDP candidates belonging to a call.
-
-    This is intentionally dependency-free so the network module can decide
-    whether an otherwise-unowned transport-info stanza should be preserved
-    without importing GStreamer or GTK.
-    """
+    """Return True for transport-info that actually contains ICE candidates."""
     if event.action != "transport-info":
         return False
     return any(section.candidates for section in event.description.media)
+
+
+def is_rtp_session_initiate(event: JingleEvent) -> bool:
+    """Return True when an unowned session-initiate is clearly an RTP call."""
+    return event.action == "session-initiate" and any(
+        section.media in {"audio", "video"} for section in event.description.media
+    )
+
+
+def should_claim_jingle(event: JingleEvent, *, owns_sid: bool) -> bool:
+    """Decide whether Gajim Calls may consume a Jingle IQ.
+
+    `transport-info` does not identify the Jingle application. An unowned ICE
+    stanza can therefore belong to file transfer or another plugin and must be
+    left to Gajim's normal Jingle handlers. JMI calls already create/own their
+    SID at proposal time, so their early trickle ICE still passes this gate.
+    """
+    return owns_sid or is_rtp_session_initiate(event)
 
 
 class RemoteCandidateBuffer:
     """Preserve trickled ICE candidates until the media engine exists.
 
     Conversations can trickle transport-info while an incoming call is still
-    ringing, and in racey/direct-Jingle flows a transport-info stanza can even
-    be observed before session-initiate has caused the plugin to claim the SID.
-    Keep candidates keyed by SID so one call can never consume another call's
-    ICE candidates.
+    ringing. Keep candidates keyed by SID so one call can never consume another
+    call's ICE candidates.
     """
 
     def __init__(self) -> None:

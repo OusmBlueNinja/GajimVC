@@ -1,4 +1,8 @@
-from gajim_calls.incoming import RemoteCandidateBuffer, is_ice_transport_info
+from gajim_calls.incoming import (
+    RemoteCandidateBuffer,
+    is_ice_transport_info,
+    should_claim_jingle,
+)
 from gajim_calls.protocol import JingleEvent
 from gajim_calls.sdp import IceCandidate, MediaSection, SessionDescription
 
@@ -41,6 +45,26 @@ def _transport_event(sid: str, mid: str, candidate: IceCandidate) -> JingleEvent
             ]
         ),
     )
+
+
+def test_owned_transport_info_is_claimed_but_unknown_transport_info_is_not() -> None:
+    event = _transport_event("call-a", "0", _candidate("192.168.1.50", 50000))
+    assert is_ice_transport_info(event)
+    assert should_claim_jingle(event, owns_sid=True)
+    assert not should_claim_jingle(event, owns_sid=False)
+
+
+def test_unowned_rtp_session_initiate_is_claimed_as_new_call() -> None:
+    event = JingleEvent(
+        action="session-initiate",
+        sid="direct-call",
+        initiator="phone@example.test/Conversations",
+        responder=None,
+        description=SessionDescription(
+            media=[MediaSection(media="audio", mid="audio")]
+        ),
+    )
+    assert should_claim_jingle(event, owns_sid=False)
 
 
 def test_transport_info_is_preserved_before_accept() -> None:
@@ -115,6 +139,7 @@ def test_empty_transport_info_is_not_claimed_as_call_ice() -> None:
     )
 
     assert not is_ice_transport_info(event)
+    assert not should_claim_jingle(event, owns_sid=False)
     buffer = RemoteCandidateBuffer()
     assert buffer.add_event(event) == 0
     assert len(buffer) == 0

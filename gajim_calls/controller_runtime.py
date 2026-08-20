@@ -53,10 +53,24 @@ class RuntimeCallController(CallController):
         return handled
 
     def handle_jingle(self, account: str, from_jid: str, event: JingleEvent) -> None:
-        # Conversations can trickle ICE while the incoming call is still
-        # ringing, and direct-Jingle races can deliver transport-info before
-        # session-initiate has created the call context. Preserve it by SID.
+        # Conversations can trickle ICE while a JMI call is still ringing. The
+        # JMI proposal has already created the call context, so buffer only the
+        # exact account/SID we own. Never let an unrelated Jingle session feed
+        # candidates into the active call.
         if event.action == "transport-info" and self.media is None:
+            context = self.context
+            if (
+                context is None
+                or context.account != account
+                or context.sid != event.sid
+                or context.state in _TERMINAL_STATES
+            ):
+                log.debug(
+                    "Ignoring unowned early ICE sid=%s account=%s",
+                    event.sid,
+                    account,
+                )
+                return
             added = self._early_remote_candidates.add_event(event)
             if added:
                 log.info(
@@ -99,8 +113,6 @@ class RuntimeCallController(CallController):
             )
 
     def _send_local_candidate(self, mid: str, candidate_text: str) -> None:
-        # GStreamer/libnice emits an empty candidate when gathering has
-        # completed. It is an end-of-candidates marker, not malformed ICE.
         if not candidate_text.strip():
             log.debug("Local ICE gathering complete for mid=%s", mid)
             return
@@ -224,8 +236,6 @@ class RuntimeCallController(CallController):
                     peer,
                 )
 
-            # Mark terminal and close media before any queued GStreamer callback
-            # can turn the call back into Connected or show a failure dialog.
             self.plugin.set_call_active(False)
             self._finish_local(CallState.ENDED)
             return

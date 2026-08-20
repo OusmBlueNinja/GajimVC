@@ -13,7 +13,7 @@ from nbxmpp.structs import StanzaHandler
 from gajim.common.modules.base import BaseModule
 
 from .constants import NS_JINGLE, NS_JMI
-from .incoming import is_ice_transport_info
+from .incoming import should_claim_jingle
 from .protocol import (
     build_jingle,
     build_jmi,
@@ -106,19 +106,10 @@ class CallsModule(BaseModule):
             return
 
         owned = _controller.owns_sid(self._account, event.sid)
-        rtp_offer = (
-            event.action == "session-initiate"
-            and any(
-                section.media in {"audio", "video"}
-                for section in event.description.media
-            )
-        )
-        # A peer can trickle ICE before the controller has claimed the SID.
-        # Preserve only transport-info that actually contains ICE-UDP
-        # candidates; leave unrelated Jingle traffic to Gajim's own modules.
-        early_ice = is_ice_transport_info(event)
-        if not owned and not rtp_offer and not early_ice:
-            # Leave non-call Jingle (for example file transfers) to Gajim.
+        if not should_claim_jingle(event, owns_sid=owned):
+            # `transport-info` does not identify its application. Never consume
+            # ICE for an unknown SID: it may belong to file transfer or another
+            # Jingle user. A new, unowned RTP session-initiate is unambiguous.
             return
 
         from_jid = stanza.getFrom()
@@ -134,8 +125,8 @@ class CallsModule(BaseModule):
         )
         _log_candidates("RX", event.description)
 
-        # Jingle actions are IQ-set and must be acknowledged even when the user
-        # has not answered the ringing UI yet.
+        # Jingle actions are IQ-set and must be acknowledged promptly. Do this
+        # before media/device work or showing the incoming UI.
         response = stanza.buildReply("result")
         query = response.getQuery()
         if query is not None:

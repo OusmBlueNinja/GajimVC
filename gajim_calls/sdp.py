@@ -130,7 +130,7 @@ def parse_sdp(sdp: str) -> SessionDescription:
             parts = line[2:].split()
             if len(parts) < 4:
                 continue
-            current = MediaSection(media=parts[0], mid=parts[0])
+            current = MediaSection(media=parts[0], mid=parts[0], rtcp_mux=False)
             current.ice_ufrag = session_ice_ufrag
             current.ice_pwd = session_ice_pwd
             current.fingerprint = session_fp
@@ -256,13 +256,11 @@ def parse_sdp(sdp: str) -> SessionDescription:
         if not section.ice_pwd:
             section.ice_pwd = session_ice_pwd
 
-    if not bundle:
-        bundle = tuple(section.mid for section in media)
     return SessionDescription(media=media, bundle=bundle)
 
 
 def build_sdp(description: SessionDescription, *, answer: bool = False) -> str:
-    mids = description.bundle or tuple(section.mid for section in description.media)
+    mids = description.bundle
     lines = [
         "v=0",
         "o=- 0 0 IN IP4 0.0.0.0",

@@ -12,6 +12,10 @@ def test_build_archive_is_gajim_installable(tmp_path: Path):
     build(repo, output)
     verify(output)
 
+    source_manifest = json.loads(
+        (repo / "gajim_calls" / "plugin-manifest.json").read_text(encoding="utf-8")
+    )
+
     with zipfile.ZipFile(output) as archive:
         names = archive.namelist()
         assert "gajim_calls/plugin-manifest.json" in names
@@ -20,5 +24,5 @@ def test_build_archive_is_gajim_installable(tmp_path: Path):
             archive.read("gajim_calls/plugin-manifest.json").decode()
         )
         assert manifest["short_name"] == "gajim_calls"
-        assert manifest["version"] == "0.1.1"
+        assert manifest["version"] == source_manifest["version"]
         assert manifest["requirements"] == ["gajim>=2.4.2,<2.6.0"]

@@ -20,32 +20,33 @@ class RuntimeCallController(CallController):
         self._early_remote_candidates = RemoteCandidateBuffer()
 
     def handle_jingle(self, account: str, from_jid: str, event: JingleEvent) -> None:
-        # Conversations commonly trickles ICE candidates while the incoming
-        # call is still ringing. The base controller used to silently drop
-        # transport-info until the user clicked Accept because self.media did
-        # not exist yet. Preserve those candidates and feed them into the media
-        # engine as soon as answering begins.
+        # Conversations can trickle ICE while the incoming call is still
+        # ringing, and direct-Jingle races can deliver transport-info before
+        # session-initiate has created the call context. Preserve it by SID.
         if event.action == "transport-info" and self.media is None:
             added = self._early_remote_candidates.add_event(event)
             if added:
                 log.info(
-                    "Buffered %d remote ICE candidate(s) before incoming call accept",
+                    "Buffered %d remote ICE candidate(s) for sid=%s before media startup",
                     added,
+                    event.sid,
                 )
             return
 
         super().handle_jingle(account, from_jid, event)
 
     def _start_media(self, *, offerer: bool, remote_offer=None) -> None:
+        context = self.context
         super()._start_media(offerer=offerer, remote_offer=remote_offer)
-        if self.media is None:
+        if self.media is None or context is None:
             return
 
-        flushed = self._early_remote_candidates.flush_to(self.media)
+        flushed = self._early_remote_candidates.flush_to(self.media, context.sid)
         if flushed:
             log.info(
-                "Applied %d buffered remote ICE candidate(s) after call accept",
+                "Applied %d buffered remote ICE candidate(s) for sid=%s",
                 flushed,
+                context.sid,
             )
 
     def _finish_local(self, state: CallState, *, hide: bool = True) -> None:

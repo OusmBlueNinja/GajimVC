@@ -1,0 +1,48 @@
+name: Build Gajim Calls
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test-and-package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install test tools
+        run: python -m pip install --upgrade pytest ruff
+
+      - name: Lint
+        run: ruff check gajim_calls tests scripts
+
+      - name: Unit tests
+        run: python -m pytest -q
+
+      - name: Compile Python
+        run: python -m compileall -q gajim_calls
+
+      - name: Build installable Gajim archive
+        run: python scripts/build_plugin.py --output dist/gajim_calls.zip
+
+      - name: Verify archive layout
+        run: python scripts/verify_archive.py dist/gajim_calls.zip
+
+      - name: Stage directly installable artifact
+        run: |
+          mkdir -p dist/artifact
+          unzip -q dist/gajim_calls.zip -d dist/artifact
+
+      - name: Upload plugin archive
+        uses: actions/upload-artifact@v3
+        with:
+          name: gajim-calls
+          path: dist/artifact/
+          if-no-files-found: error

@@ -42,6 +42,11 @@ class CallController:
     def _bare(jid: str) -> str:
         return str(JID.from_string(jid).new_as_bare())
 
+    @staticmethod
+    def _octet_less(left: str, right: str) -> bool:
+        """Compare identifiers using the octet ordering required by JMI tie-breaks."""
+        return left.encode("utf-8") < right.encode("utf-8")
+
     def _module(self, account: str):
         return app.get_client(account).get_module("DeauthCalls")  # type: ignore[arg-type]
 
@@ -83,7 +88,8 @@ class CallController:
     def handle_jmi(self, account: str, from_jid: str, event: JMIEvent) -> bool:
         if event.action == "propose":
             # XEP-0353 tie-break applies only when both sides are proposing the
-            # same peer relationship. Lower session ID wins.
+            # same peer relationship. Lower session ID wins; if IDs are equal,
+            # the lower JID wins using i;octet ordering.
             same_peer_proposal = (
                 self.context is not None
                 and self.context.state == CallState.PROPOSING
@@ -92,7 +98,11 @@ class CallController:
             )
             if same_peer_proposal:
                 assert self.context is not None
-                if event.id >= self.context.sid:
+                remote_wins = event.id < self.context.sid or (
+                    event.id == self.context.sid
+                    and self._octet_less(from_jid, self._own_jid(account))
+                )
+                if not remote_wins:
                     self._module(account).send_jmi(
                         from_jid,
                         "reject",

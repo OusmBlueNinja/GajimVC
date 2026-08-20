@@ -259,3 +259,50 @@ def test_incoming_conversations_audio_handshake_reaches_connected(monkeypatch):
     controller._on_media_connected()
     assert context.state is CallState.CONNECTED
     assert controller.window.connected_calls == [False]
+
+
+def test_equal_jmi_session_ids_are_won_by_lower_remote_jid(monkeypatch):
+    controller = _harness(monkeypatch)
+    controller.start_outgoing("acc", "a@example.test", video=False)
+    outgoing = controller.context
+    assert outgoing is not None
+    outgoing.sid = "same-id"
+
+    assert controller.handle_jmi(
+        "acc",
+        "a@example.test/Phone",
+        JMIEvent("propose", "same-id", media=("audio",)),
+    )
+
+    assert any(
+        item["action"] == "retract"
+        and item["sid"] == "same-id"
+        and item["tie_break"] is True
+        for item in controller.signaling.jmi
+    )
+    assert controller.context is not None
+    assert controller.context.incoming is True
+    assert controller.context.peer_full == "a@example.test/Phone"
+    assert controller.context.state is CallState.RINGING
+
+
+def test_equal_jmi_session_ids_reject_higher_remote_jid(monkeypatch):
+    controller = _harness(monkeypatch)
+    controller.start_outgoing("acc", "z@example.test", video=False)
+    outgoing = controller.context
+    assert outgoing is not None
+    outgoing.sid = "same-id"
+
+    assert controller.handle_jmi(
+        "acc",
+        "z@example.test/Phone",
+        JMIEvent("propose", "same-id", media=("audio",)),
+    )
+
+    assert controller.context is outgoing
+    assert outgoing.state is CallState.PROPOSING
+    rejected = controller.signaling.jmi[-1]
+    assert rejected["action"] == "reject"
+    assert rejected["sid"] == "same-id"
+    assert rejected["reason"] == "expired"
+    assert rejected["tie_break"] is True

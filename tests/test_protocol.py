@@ -101,3 +101,27 @@ def test_transport_info_preserves_ice_credentials_and_fingerprint():
     assert section.ice_pwd == "passwordpassword"
     assert section.fingerprint is not None
     assert section.fingerprint.value == "AA:BB:CC"
+
+
+def test_failure_jingle_reason_round_trip():
+    xml = xml_text(
+        build_jingle(
+            "session-terminate",
+            "failed-call",
+            initiator="a@example.test/desktop",
+            responder="b@example.test/phone",
+            reason="connectivity-error",
+        )
+    )
+    parsed = parse_jingle(xml)
+    assert parsed is not None
+    assert parsed.action == "session-terminate"
+    assert parsed.reason == "connectivity-error"
+
+
+def test_failure_jmi_finish_reason_round_trip():
+    xml = xml_text(build_jmi("finish", "failed-call", reason="connectivity-error"))
+    parsed = parse_jmi(xml)
+    assert parsed is not None
+    assert parsed.action == "finish"
+    assert parsed.reason == "connectivity-error"

@@ -49,6 +49,85 @@ class RuntimeCallController(CallController):
                 context.sid,
             )
 
+    def _send_local_candidate(self, mid: str, candidate_text: str) -> None:
+        # GStreamer/libnice emits an empty candidate when gathering has
+        # completed. It is an end-of-candidates marker, not malformed ICE.
+        if not candidate_text.strip():
+            log.debug("Local ICE gathering complete for mid=%s", mid)
+            return
+        super()._send_local_candidate(mid, candidate_text)
+
+    @staticmethod
+    def _failure_reason(reason: str) -> str:
+        if "ICE connectivity checks failed" in reason:
+            return "connectivity-error"
+        if "encoder" in reason.lower() or "media" in reason.lower():
+            return "failed-application"
+        return "general-error"
+
+    def _terminate_remote_failure(self, reason: str) -> None:
+        """Tell the peer that a locally failed negotiation is over.
+
+        Without this, Conversations remains in its Connecting state until its
+        own timeout because the local media engine disappears without a final
+        Jingle/JMI termination signal.
+        """
+        context = self.context
+        if context is None:
+            return
+
+        wire_reason = self._failure_reason(reason)
+        peer = context.peer_full or context.peer_bare
+        module = self._module(context.account)
+
+        try:
+            if context.peer_full is not None and context.state in {
+                CallState.NEGOTIATING,
+                CallState.CONNECTED,
+            }:
+                module.send_jingle(
+                    context.peer_full,
+                    "session-terminate",
+                    context.sid,
+                    initiator=context.initiator or self._own_jid(context.account),
+                    responder=context.responder,
+                    reason=wire_reason,
+                )
+                log.info(
+                    "TX failure session-terminate sid=%s to=%s reason=%s",
+                    context.sid,
+                    context.peer_full,
+                    wire_reason,
+                )
+
+            # JMI finish is useful even after Jingle has started: Conversations
+            # uses it to clear the higher-level call proposal state promptly.
+            module.send_jmi(peer, "finish", context.sid, reason=wire_reason)
+            log.info(
+                "TX failure JMI finish sid=%s to=%s reason=%s",
+                context.sid,
+                peer,
+                wire_reason,
+            )
+        except Exception:
+            # A signaling failure must never prevent local media cleanup or the
+            # user-facing failure dialog from being shown.
+            log.exception(
+                "Unable to signal remote call failure sid=%s peer=%s reason=%s",
+                context.sid,
+                peer,
+                wire_reason,
+            )
+
+    def _on_media_failed(self, reason: str) -> None:
+        if self.context is None:
+            return
+
+        log.error("Call failed: %s", reason)
+        self._terminate_remote_failure(reason)
+        self._get_window().set_status(f"Call failed: {reason}")
+        self._finish_local(CallState.FAILED, hide=False)
+
     def _finish_local(self, state: CallState, *, hide: bool = True) -> None:
         self._early_remote_candidates.clear()
         super()._finish_local(state, hide=hide)

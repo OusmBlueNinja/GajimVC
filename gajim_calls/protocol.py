@@ -219,8 +219,6 @@ def _media_to_content(
     include_description: bool = True,
 ) -> ET.Element:
     attrs = {"creator": creator, "name": section.mid}
-    # transport-info identifies an existing content and carries no RTP
-    # description. Do not restate a possibly stale senders value there.
     if include_description:
         attrs["senders"] = _direction_to_senders(section.direction, owner_role)
     content = ET.Element(qname(NS_JINGLE, "content"), attrs)
@@ -271,9 +269,6 @@ def build_jingle(
     root = ET.Element(qname(NS_JINGLE, "jingle"), attrs)
 
     if description is not None:
-        # XEP-0338 maps the SDP group exactly to a Jingle group. A WebRTC
-        # audio-only description can legitimately contain a one-member BUNDLE
-        # group; dropping it changes the negotiated description on the wire.
         mids = description.bundle
         if mids:
             group = ET.SubElement(
@@ -370,10 +365,31 @@ def parse_jingle(xml_or_element: str | ET.Element) -> JingleEvent | None:
             section.direction = _senders_to_direction(
                 content.attrib.get("senders", "both"), owner_role
             )
-            section.codecs = [
+            codecs = [
                 _codec_from_xml(item)
                 for item in description.findall(qname(NS_RTP, "payload-type"))
                 if item.attrib.get("id") and item.attrib.get("name")
+            ]
+            description_feedback = tuple(
+                (item.attrib.get("type", ""), item.attrib.get("subtype", ""))
+                for item in description.findall(qname(NS_RTCP_FB, "rtcp-fb"))
+                if item.attrib.get("type")
+            )
+            section.codecs = [
+                Codec(
+                    codec.payload_type,
+                    codec.name,
+                    codec.clockrate,
+                    codec.channels,
+                    codec.parameters,
+                    codec.rtcp_feedback
+                    + tuple(
+                        feedback
+                        for feedback in description_feedback
+                        if feedback not in codec.rtcp_feedback
+                    ),
+                )
+                for codec in codecs
             ]
             section.rtcp_mux = description.find(qname(NS_RTP, "rtcp-mux")) is not None
 

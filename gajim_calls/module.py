@@ -12,7 +12,7 @@ from nbxmpp.structs import StanzaHandler
 
 from gajim.common.modules.base import BaseModule
 
-from .constants import NS_JINGLE, NS_JMI
+from .constants import NS_JINGLE
 from .incoming import should_claim_jingle
 from .jmi_migration import add_migrated_element
 from .protocol import (

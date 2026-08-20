@@ -117,7 +117,7 @@ jobs:
 
           case "$STATUS" in
             200)
-              echo "Release $TAG already exists for this commit; repairing/replacing its generated assets."
+              echo "Release $TAG already exists for this commit; repairing/replacing its generated plugin asset."
               echo "publish=true" >> "$GITHUB_OUTPUT"
               echo "existing=true" >> "$GITHUB_OUTPUT"
               ;;
@@ -168,7 +168,7 @@ jobs:
                   "tag_name": os.environ["TAG"],
                   "target_commitish": os.environ["SHA"],
                   "name": f"Gajim Calls {os.environ['TAG']}",
-                  "body": "Automated Gajim Calls release. Includes a manual-install ZIP and Gajim plugin-repository files.",
+                  "body": f"Download **gajim_calls-{os.environ['VERSION']}.zip** below and install it from Gajim's Plugins window. The other automatic updater files are published separately and are not release downloads.",
                   "draft": False,
                   "prerelease": False,
               },
@@ -187,7 +187,7 @@ jobs:
           RELEASE_ID="$(python -c 'import json; print(json.load(open("/tmp/published-release.json"))["id"])')"
           echo "id=$RELEASE_ID" >> "$GITHUB_OUTPUT"
 
-      - name: Upload release assets
+      - name: Upload the single plugin release asset
         if: ${{ steps.publish.outputs.publish == 'true' }}
         shell: bash
         env:
@@ -196,35 +196,27 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          UPDATER_ZIP="dist/repository/gajim_calls/gajim_calls_${VERSION}.zip"
-          ASSETS=(
-            "dist/gajim_calls-${VERSION}.zip"
-            "$UPDATER_ZIP"
-            "dist/repository/package_index.json"
-            "dist/repository/images.zip"
-          )
+          ASSET="dist/gajim_calls-${VERSION}.zip"
+          NAME="$(basename "$ASSET")"
 
-          for ASSET in "${ASSETS[@]}"; do
-            NAME="$(basename "$ASSET")"
-            EXISTING_ID="$(curl -fsS \
+          ASSETS_JSON="$(curl -fsS \
+            -H "Authorization: token $GITEA_TOKEN" \
+            -H "Accept: application/json" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets")"
+
+          EXISTING_ID="$(printf '%s' "$ASSETS_JSON" | python -c 'import json, sys; name=sys.argv[1]; print(next((str(a["id"]) for a in json.load(sys.stdin) if a["name"] == name), ""))' "$NAME")"
+          if [ -n "$EXISTING_ID" ]; then
+            curl -fsS -X DELETE \
               -H "Authorization: token $GITEA_TOKEN" \
-              -H "Accept: application/json" \
-              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets" \
-              | python -c 'import json, sys; name=sys.argv[1]; print(next((str(a["id"]) for a in json.load(sys.stdin) if a["name"] == name), ""))' "$NAME")"
+              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets/$EXISTING_ID"
+          fi
 
-            if [ -n "$EXISTING_ID" ]; then
-              curl -fsS -X DELETE \
-                -H "Authorization: token $GITEA_TOKEN" \
-                "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets/$EXISTING_ID"
-            fi
-
-            curl -fsS -X POST \
-              -H "Authorization: token $GITEA_TOKEN" \
-              -H "Accept: application/json" \
-              -F "attachment=@$ASSET" \
-              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?name=$NAME" \
-              > /dev/null
-          done
+          curl -fsS -X POST \
+            -H "Authorization: token $GITEA_TOKEN" \
+            -H "Accept: application/json" \
+            -F "attachment=@$ASSET" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?name=$NAME" \
+            > /dev/null
 
       - name: Publish Gajim plugin repository branch
         if: ${{ steps.publish.outputs.publish == 'true' }}
@@ -255,3 +247,92 @@ jobs:
             git -C "$PUBLISH_DIR" commit -m "Publish Gajim Calls $TAG"
             git -C "$PUBLISH_DIR" push origin HEAD:plugin-repository
           fi
+
+  clean-release-downloads:
+    if: ${{ gitea.event_name == 'push' && gitea.ref == 'refs/heads/main' }}
+    needs: test-and-package
+    runs-on: ubuntu-latest
+    permissions:
+      releases: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Remove updater files from the human-facing release
+        shell: bash
+        env:
+          GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="$(python - <<'PY'
+          import json
+          from pathlib import Path
+          print(json.loads(Path("gajim_calls/plugin-manifest.json").read_text(encoding="utf-8"))["version"])
+          PY
+          )"
+          TAG="v$VERSION"
+
+          STATUS="$(curl -sS -o /tmp/release.json -w '%{http_code}' \
+            -H "Authorization: token $GITEA_TOKEN" \
+            -H "Accept: application/json" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/tags/$TAG")"
+
+          if [ "$STATUS" = "404" ]; then
+            echo "Release $TAG does not exist yet; nothing to clean."
+            exit 0
+          fi
+          if [ "$STATUS" != "200" ]; then
+            cat /tmp/release.json || true
+            echo "Unexpected Gitea API status: $STATUS" >&2
+            exit 1
+          fi
+
+          RELEASE_ID="$(python -c 'import json; print(json.load(open("/tmp/release.json"))["id"])')"
+          curl -fsS \
+            -H "Authorization: token $GITEA_TOKEN" \
+            -H "Accept: application/json" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets" \
+            > /tmp/assets.json
+
+          VERSION="$VERSION" python - <<'PY' > /tmp/delete-assets.txt
+          import json
+          import os
+
+          version = os.environ["VERSION"]
+          remove = {
+              f"gajim_calls_{version}.zip",
+              "images.zip",
+              "package_index.json",
+          }
+          for asset in json.load(open("/tmp/assets.json", encoding="utf-8")):
+              if asset["name"] in remove:
+                  print(asset["id"])
+          PY
+
+          while read -r ASSET_ID; do
+            [ -n "$ASSET_ID" ] || continue
+            curl -fsS -X DELETE \
+              -H "Authorization: token $GITEA_TOKEN" \
+              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets/$ASSET_ID"
+          done < /tmp/delete-assets.txt
+
+          VERSION="$VERSION" python - <<'PY' > /tmp/update-release.json
+          import json
+          import os
+
+          version = os.environ["VERSION"]
+          json.dump(
+              {
+                  "body": f"Download **gajim_calls-{version}.zip** below and install it from Gajim's Plugins window."
+              },
+              __import__("sys").stdout,
+          )
+          PY
+
+          curl -fsS -X PATCH \
+            -H "Authorization: token $GITEA_TOKEN" \
+            -H "Accept: application/json" \
+            -H "Content-Type: application/json" \
+            --data-binary @/tmp/update-release.json \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+            > /dev/null

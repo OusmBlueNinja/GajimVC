@@ -44,23 +44,113 @@ jobs:
 
   webrtc-loopback:
     runs-on: ubuntu-latest
+    env:
+      GST_PACKAGES: >-
+        python3-gi
+        gir1.2-gstreamer-1.0
+        gir1.2-gst-plugins-bad-1.0
+        gstreamer1.0-plugins-base
+        gstreamer1.0-plugins-good
+        gstreamer1.0-plugins-bad
+        gstreamer1.0-nice
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Install GStreamer WebRTC runtime
+      - name: Decide whether real WebRTC integration is needed
+        id: webrtc-scope
+        shell: bash
+        env:
+          EVENT_NAME: ${{ gitea.event_name }}
+          REF_NAME: ${{ gitea.ref }}
+          BEFORE: ${{ gitea.event.before }}
         run: |
+          set -euo pipefail
+
+          # Releases are gated on this job, so every main push must exercise the
+          # real GStreamer ICE/DTLS path. Manual runs should exercise it too.
+          if [ "$EVENT_NAME" != "push" ] || [ "$REF_NAME" = "refs/heads/main" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          BEFORE_SHA="$BEFORE"
+          if [ -z "$BEFORE_SHA" ] || [[ "$BEFORE_SHA" =~ ^0+$ ]]; then
+            BEFORE_SHA="$(git rev-parse HEAD^ 2>/dev/null || true)"
+          fi
+
+          # If the comparison cannot be made safely, run the integration test
+          # rather than accidentally skipping coverage.
+          if [ -z "$BEFORE_SHA" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! CHANGED_PATHS="$(git diff --name-only "$BEFORE_SHA" "$GITHUB_SHA" 2>/dev/null)"; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ -z "$CHANGED_PATHS" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          while IFS= read -r path; do
+            case "$path" in
+              docs/*|README.md|CONTRIBUTING.md|LICENSE|gajim_calls/gtk/*)
+                ;;
+              *)
+                echo "run=true" >> "$GITHUB_OUTPUT"
+                exit 0
+                ;;
+            esac
+          done <<< "$CHANGED_PATHS"
+
+          echo "run=false" >> "$GITHUB_OUTPUT"
+
+      - name: Build GStreamer package cache key
+        if: ${{ steps.webrtc-scope.outputs.run == 'true' }}
+        id: gst-cache-key
+        shell: bash
+        run: |
+          set -euo pipefail
+          . /etc/os-release
+          PACKAGE_HASH="$(printf '%s' "$GST_PACKAGES" | sha256sum | cut -c1-16)"
+          echo "key=${ID}-${VERSION_ID}-$(dpkg --print-architecture)-${PACKAGE_HASH}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore cached GStreamer packages
+        if: ${{ steps.webrtc-scope.outputs.run == 'true' }}
+        id: gst-cache
+        uses: actions/cache@v4
+        with:
+          path: .ci-cache/gstreamer-debs
+          key: gstreamer-webrtc-debs-${{ steps.gst-cache-key.outputs.key }}
+
+      - name: Download GStreamer WebRTC runtime
+        if: ${{ steps.webrtc-scope.outputs.run == 'true' && steps.gst-cache.outputs.cache-hit != 'true' }}
+        run: |
+          set -euo pipefail
+          CACHE_DIR="$PWD/.ci-cache/gstreamer-debs"
+          mkdir -p "$CACHE_DIR/partial"
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            python3-gi \
-            gir1.2-gstreamer-1.0 \
-            gir1.2-gst-plugins-bad-1.0 \
-            gstreamer1.0-plugins-base \
-            gstreamer1.0-plugins-good \
-            gstreamer1.0-plugins-bad \
-            gstreamer1.0-nice
+          sudo apt-get \
+            -o Dir::Cache::archives="$CACHE_DIR" \
+            install -y --no-install-recommends --download-only \
+            $GST_PACKAGES
+          test -n "$(find "$CACHE_DIR" -maxdepth 1 -name '*.deb' -print -quit)"
+
+      - name: Install GStreamer WebRTC runtime from local packages
+        if: ${{ steps.webrtc-scope.outputs.run == 'true' }}
+        run: |
+          set -euo pipefail
+          CACHE_DIR="$PWD/.ci-cache/gstreamer-debs"
+          sudo apt-get install -y --no-install-recommends "$CACHE_DIR"/*.deb
 
       - name: Real ICE and DTLS loopback test
+        if: ${{ steps.webrtc-scope.outputs.run == 'true' }}
         env:
           GST_DEBUG: "webrtc*:4,libnice*:4"
         run: /usr/bin/python3 tests/integration_webrtc.py

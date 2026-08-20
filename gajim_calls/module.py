@@ -63,8 +63,6 @@ def _log_candidates(prefix: str, description: SessionDescription) -> None:
 class CallsModule(BaseModule):
     def __init__(self, client) -> None:
         BaseModule.__init__(self, client, plugin=True)
-        # Priority 5 deliberately runs before Gajim's legacy Jingle module. We
-        # raise NodeProcessed only for RTP calls owned by this plugin.
         self.handlers = [
             StanzaHandler(
                 name="message",
@@ -105,16 +103,30 @@ class CallsModule(BaseModule):
         if event is None or _controller is None:
             return
 
-        owned = _controller.owns_sid(self._account, event.sid)
-        if not should_claim_jingle(event, owns_sid=owned):
-            # `transport-info` does not identify its application. Never consume
-            # ICE for an unknown SID: it may belong to file transfer or another
-            # Jingle user. A new, unowned RTP session-initiate is unambiguous.
-            return
-
         from_jid = stanza.getFrom()
         if from_jid is None:
             return
+        sender = str(from_jid)
+
+        owned = _controller.owns_sid(self._account, event.sid)
+        if not should_claim_jingle(event, owns_sid=owned):
+            return
+
+        # Validate the peer before ACKing an owned session. Returning here lets
+        # other Jingle handlers treat the stanza as unknown/unrelated instead of
+        # allowing a guessed/stale SID to inject media state into this call.
+        if owned:
+            accepts_sender = getattr(_controller, "accepts_jingle_sender", None)
+            if callable(accepts_sender) and not accepts_sender(
+                self._account, event.sid, sender, event.action
+            ):
+                log.warning(
+                    "Ignoring Jingle %s sid=%s from unexpected sender=%s",
+                    event.action,
+                    event.sid,
+                    sender,
+                )
+                return
 
         log.info(
             "RX Jingle %s sid=%s from=%s media=%s",
@@ -125,15 +137,13 @@ class CallsModule(BaseModule):
         )
         _log_candidates("RX", event.description)
 
-        # Jingle actions are IQ-set and must be acknowledged promptly. Do this
-        # before media/device work or showing the incoming UI.
         response = stanza.buildReply("result")
         query = response.getQuery()
         if query is not None:
             response.delChild(query)
         self._send(response)
 
-        _controller.handle_jingle(self._account, str(from_jid), event)
+        _controller.handle_jingle(self._account, sender, event)
         raise nbxmpp.NodeProcessed
 
     def send_jmi(
@@ -164,10 +174,6 @@ class CallsModule(BaseModule):
         log.info("TX JMI %s sid=%s to=%s", action, sid, to_jid)
         self._send(message)
 
-        # XEP-0353 recommends directed presence after <proceed/> if the peers
-        # do not already share presence. Sending it unconditionally is harmless
-        # and is particularly useful for calls between resources of the same
-        # bare JID and contacts without a mutual presence subscription.
         if action == "proceed":
             log.info("TX directed presence to=%s", to_jid)
             self._send(Presence(to=to_jid))

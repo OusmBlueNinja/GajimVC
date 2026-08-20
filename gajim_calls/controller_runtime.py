@@ -8,6 +8,7 @@ from gi.repository import GLib
 
 from .controller import CallController
 from .incoming import RemoteCandidateBuffer
+from .peer_validation import jingle_sender_allowed, jmi_sender_allowed
 from .protocol import JMIEvent, JingleEvent
 from .sdp import SessionDescription
 from .state import CallState
@@ -33,6 +34,25 @@ class RuntimeCallController(CallController):
     @staticmethod
     def _uses_jmi(context) -> bool:
         return context.metadata.get("signaling") == "jmi"
+
+    def accepts_jingle_sender(
+        self, account: str, sid: str, sender: str, action: str
+    ) -> bool:
+        context = self.context
+        if (
+            context is None
+            or context.account != account
+            or context.sid != sid
+            or context.state in _TERMINAL_STATES
+        ):
+            return False
+        return jingle_sender_allowed(
+            peer_bare=context.peer_bare,
+            peer_full=context.peer_full,
+            sender=sender,
+            action=action,
+            incoming=context.incoming,
+        )
 
     def _cancel_phase_timeout(self) -> None:
         source_id = self._phase_timeout_id
@@ -72,8 +92,6 @@ class RuntimeCallController(CallController):
         return self._local_description is not None
 
     def _on_phase_timeout(self, sid: str, phase: TimeoutPhase) -> bool:
-        # Clear the active source before cleanup; _finish_local() can safely call
-        # _cancel_phase_timeout() without trying to remove the callback in flight.
         if self._phase_timeout_sid == sid and self._phase_timeout_phase == phase:
             self._phase_timeout_id = None
             self._phase_timeout_sid = None
@@ -92,11 +110,10 @@ class RuntimeCallController(CallController):
         else:
             return GLib.SOURCE_REMOVE
 
-        uses_jmi = self._uses_jmi(context)
         plan = plan_timeout(
             phase,
             incoming=context.incoming,
-            uses_jmi=uses_jmi,
+            uses_jmi=self._uses_jmi(context),
             jingle_started=self._jingle_started(context),
         )
         module = self._module(context.account)
@@ -119,11 +136,7 @@ class RuntimeCallController(CallController):
                 )
 
             if plan.jmi_action is not None:
-                target = (
-                    context.peer_bare
-                    if plan.jmi_action == "retract"
-                    else peer
-                )
+                target = context.peer_bare if plan.jmi_action == "retract" else peer
                 module.send_jmi(
                     target,
                     plan.jmi_action,
@@ -187,6 +200,19 @@ class RuntimeCallController(CallController):
             callback(sid)
 
     def handle_jmi(self, account: str, from_jid: str, event: JMIEvent) -> bool:
+        context = self.context
+        if event.action != "propose" and context is not None and event.id == context.sid:
+            if context.account != account or not jmi_sender_allowed(
+                peer_bare=context.peer_bare, sender=from_jid
+            ):
+                log.warning(
+                    "Ignoring JMI %s sid=%s from unexpected sender=%s",
+                    event.action,
+                    event.id,
+                    from_jid,
+                )
+                return False
+
         handled = super().handle_jmi(account, from_jid, event)
         context = self.context
         if handled and event.action == "propose":
@@ -200,6 +226,17 @@ class RuntimeCallController(CallController):
         return handled
 
     def handle_jingle(self, account: str, from_jid: str, event: JingleEvent) -> None:
+        context = self.context
+        if context is not None and event.sid == context.sid:
+            if not self.accepts_jingle_sender(account, event.sid, from_jid, event.action):
+                log.warning(
+                    "Ignoring Jingle %s sid=%s from unexpected sender=%s",
+                    event.action,
+                    event.sid,
+                    from_jid,
+                )
+                return
+
         if event.action == "transport-info" and self.media is None:
             context = self.context
             if (
@@ -227,13 +264,15 @@ class RuntimeCallController(CallController):
         context = self.context
         if event.action == "session-initiate":
             if context is not None and context.sid == event.sid:
+                # Treat the authenticated stanza sender as the initiator unless
+                # another protocol explicitly authorizes redirection.
+                if context.incoming:
+                    context.peer_full = from_jid
+                    context.initiator = from_jid
                 self._start_incoming_alerts()
                 if context.state == CallState.RINGING:
-                    # Direct Jingle arrived without JMI and is waiting for user.
                     self._arm_phase_timeout("ringing")
                 elif context.state == CallState.NEGOTIATING:
-                    # JMI proceed already happened; give WebRTC a fresh bounded
-                    # negotiation window once the actual offer arrives.
                     self._arm_phase_timeout("negotiating")
 
     def accept(self) -> None:

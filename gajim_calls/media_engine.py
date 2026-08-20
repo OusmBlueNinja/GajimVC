@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import logging
 
+from gi.repository import GLib
+
 from .media import (
     MediaUnavailable,
     WebRTCMediaEngine as _BaseWebRTCMediaEngine,
@@ -36,12 +38,24 @@ class WebRTCMediaEngine(_BaseWebRTCMediaEngine):
             log.warning("Could not enable MAX_BUNDLE", exc_info=True)
 
     @staticmethod
+    def _dispatch(callback, *args) -> None:
+        """Run application/XMPP/GTK callbacks on GLib's main thread."""
+
+        def invoke():
+            try:
+                callback(*args)
+            except Exception:
+                log.exception("Unhandled exception in WebRTC application callback")
+            return GLib.SOURCE_REMOVE
+
+        GLib.idle_add(invoke)
+
+    @staticmethod
     def _reply_error(reply) -> str | None:
-        # GstPromise is allowed to be replied with no GstStructure.  In
+        # GstPromise is allowed to be replied with no GstStructure. In
         # particular, set-local-description/set-remote-description commonly
-        # complete successfully with a NULL reply.  The old implementation
-        # incorrectly treated that successful completion as an error and
-        # aborted before ICE connectivity checks could run.
+        # complete successfully with a NULL reply. The old implementation
+        # incorrectly treated that successful completion as an error.
         if reply is None:
             return None
         try:
@@ -50,12 +64,55 @@ class WebRTCMediaEngine(_BaseWebRTCMediaEngine):
             error = None
         return None if error is None else str(error)
 
+    def _state(self, text: str) -> None:
+        log.info("WebRTC state: %s", text)
+        if self._on_state is not None:
+            self._dispatch(self._on_state, text)
+
+    def _fail(self, reason: str) -> None:
+        if self._failed:
+            return
+        self._failed = True
+        details = (
+            f"{reason}; local ICE candidates={self._local_candidate_count}, "
+            f"remote ICE candidates={self._remote_candidate_count}"
+        )
+        log.error("WebRTC failure: %s", details)
+        self._dispatch(self._on_failed, details)
+
     @staticmethod
     def _is_udp_candidate(candidate: str) -> bool:
         try:
             return IceCandidate.from_sdp(candidate).protocol == "udp"
         except (ValueError, TypeError):
             return False
+
+    def _on_local_offer_set(self, promise, offer, _notify) -> None:
+        error = self._reply_error(promise.get_reply())
+        if error is not None:
+            self._fail(f"Could not set local WebRTC offer: {error}")
+            return
+        description = parse_sdp(offer.sdp.as_text())
+        self._state("local offer ready")
+        self._dispatch(self._on_local_description, description)
+
+    def _on_local_answer_set(self, promise, answer, _notify) -> None:
+        error = self._reply_error(promise.get_reply())
+        if error is not None:
+            self._fail(f"Could not set local WebRTC answer: {error}")
+            return
+        description = parse_sdp(answer.sdp.as_text())
+        self._state("local answer ready")
+        self._dispatch(self._on_local_description, description)
+
+    def _on_connection_state(self, element, _pspec) -> None:
+        state = element.get_property("connection-state")
+        name = getattr(state, "value_nick", str(state)).lower()
+        self._state(f"connection={name}")
+        if name == "connected":
+            self._dispatch(self._on_connected)
+        elif name in {"failed", "closed"}:
+            self._fail(f"WebRTC connection state: {name}")
 
     def _on_local_ice(
         self, _element, mline_index: int, candidate: str
@@ -76,7 +133,7 @@ class WebRTCMediaEngine(_BaseWebRTCMediaEngine):
             if mline_index < len(parsed.media):
                 mid = parsed.media[mline_index].mid
         log.info("TX ICE candidate mid=%s %s", mid, candidate)
-        self._on_ice_candidate(mid, candidate)
+        self._dispatch(self._on_ice_candidate, mid, candidate)
 
     def add_remote_candidate(self, mid: str, candidate: str) -> None:
         # Be defensive if a peer sends ICE-TCP inside an ICE-UDP transport.

@@ -67,7 +67,6 @@ class CallsModule(BaseModule):
         self.handlers = [
             StanzaHandler(
                 name="message",
-                ns=NS_JMI,
                 callback=self._on_jmi,
                 priority=5,
             ),

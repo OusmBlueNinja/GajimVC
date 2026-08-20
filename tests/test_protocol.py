@@ -46,6 +46,38 @@ def test_jmi_propose_round_trip():
     assert event.media == ("audio", "video")
 
 
+def test_jmi_parses_from_normal_client_message_wrapper():
+    event = parse_jmi(
+        """
+        <message xmlns='jabber:client'
+                 from='phone@example.test/Conversations'
+                 to='desktop@example.test/Gajim'
+                 type='chat'>
+          <proceed xmlns='urn:xmpp:jingle-message:0' id='accepted-call'/>
+        </message>
+        """
+    )
+
+    assert event is not None
+    assert event.action == "proceed"
+    assert event.id == "accepted-call"
+
+
+def test_non_jmi_message_is_ignored_by_broad_message_handler_parser():
+    event = parse_jmi(
+        """
+        <message xmlns='jabber:client'
+                 from='phone@example.test/Conversations'
+                 to='desktop@example.test/Gajim'
+                 type='chat'>
+          <body>hello</body>
+        </message>
+        """
+    )
+
+    assert event is None
+
+
 def test_jingle_round_trip():
     xml = xml_text(
         build_jingle(

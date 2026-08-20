@@ -120,6 +120,7 @@ def parse_sdp(sdp: str) -> SessionDescription:
     session_ice_pwd = ""
     session_fp: Fingerprint | None = None
     session_setup = "actpass"
+    session_direction = "sendrecv"
     bundle: tuple[str, ...] = ()
     media: list[MediaSection] = []
     current: MediaSection | None = None
@@ -131,7 +132,12 @@ def parse_sdp(sdp: str) -> SessionDescription:
             parts = line[2:].split()
             if len(parts) < 4:
                 continue
-            current = MediaSection(media=parts[0], mid=parts[0], rtcp_mux=False)
+            current = MediaSection(
+                media=parts[0],
+                mid=parts[0],
+                rtcp_mux=False,
+                direction=session_direction,
+            )
             current.ice_ufrag = session_ice_ufrag
             current.ice_pwd = session_ice_pwd
             current.fingerprint = session_fp
@@ -143,6 +149,12 @@ def parse_sdp(sdp: str) -> SessionDescription:
         target = current
         if line.startswith("a=group:BUNDLE "):
             bundle = tuple(line.split()[1:])
+            continue
+        if line in ("a=sendrecv", "a=sendonly", "a=recvonly", "a=inactive"):
+            if target is None:
+                session_direction = line[2:]
+            else:
+                target.direction = line[2:]
             continue
         if line.startswith("a=ice-ufrag:"):
             val = line.split(":", 1)[1]
@@ -182,9 +194,6 @@ def parse_sdp(sdp: str) -> SessionDescription:
             continue
         if line.startswith("a=mid:"):
             target.mid = line.split(":", 1)[1]
-            continue
-        if line in ("a=sendrecv", "a=sendonly", "a=recvonly", "a=inactive"):
-            target.direction = line[2:]
             continue
         if line == "a=rtcp-mux":
             target.rtcp_mux = True

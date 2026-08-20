@@ -86,3 +86,62 @@ def test_transport_info_does_not_restate_senders() -> None:
     content = payload.find(qname(NS_JINGLE, "content"))
     assert content is not None
     assert "senders" not in content.attrib
+
+
+def test_session_level_sdp_direction_is_inherited_and_translated_to_jingle() -> None:
+    sdp = """v=0
+o=- 1 1 IN IP4 0.0.0.0
+s=-
+t=0 0
+a=recvonly
+m=audio 9 UDP/TLS/RTP/SAVPF 111
+c=IN IP4 0.0.0.0
+a=mid:audio
+a=rtpmap:111 OPUS/48000/2
+m=video 9 UDP/TLS/RTP/SAVPF 96
+c=IN IP4 0.0.0.0
+a=mid:video
+a=rtpmap:96 VP8/90000
+"""
+
+    description = parse_sdp(sdp)
+    assert [section.direction for section in description.media] == [
+        "recvonly",
+        "recvonly",
+    ]
+
+    payload = build_jingle(
+        "session-initiate",
+        "session-direction",
+        initiator="initiator@example.test/Desktop",
+        responder="responder@example.test/Phone",
+        description=description,
+    )
+    contents = payload.findall(qname(NS_JINGLE, "content"))
+    assert [content.attrib["senders"] for content in contents] == [
+        "responder",
+        "responder",
+    ]
+
+
+def test_media_level_sdp_direction_overrides_session_default() -> None:
+    sdp = """v=0
+o=- 1 1 IN IP4 0.0.0.0
+s=-
+t=0 0
+a=inactive
+m=audio 9 UDP/TLS/RTP/SAVPF 111
+c=IN IP4 0.0.0.0
+a=mid:audio
+a=sendonly
+a=rtpmap:111 OPUS/48000/2
+m=video 9 UDP/TLS/RTP/SAVPF 96
+c=IN IP4 0.0.0.0
+a=mid:video
+a=rtpmap:96 VP8/90000
+"""
+
+    description = parse_sdp(sdp)
+
+    assert description.media[0].direction == "sendonly"
+    assert description.media[1].direction == "inactive"

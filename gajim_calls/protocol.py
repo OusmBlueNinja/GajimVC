@@ -43,6 +43,7 @@ class JMIEvent:
     id: str
     media: tuple[str, ...] = ()
     reason: str | None = None
+    tie_break: bool = False
 
 
 @dataclass(slots=True, frozen=True)
@@ -67,6 +68,7 @@ def build_jmi(
     *,
     media: tuple[str, ...] = (),
     reason: str | None = None,
+    tie_break: bool = False,
 ) -> ET.Element:
     if not sid:
         raise ValueError("JMI id is required")
@@ -77,6 +79,8 @@ def build_jmi(
     elif reason is not None:
         reason_node = ET.SubElement(node, qname(NS_JINGLE, "reason"))
         ET.SubElement(reason_node, qname(NS_JINGLE, reason))
+    if tie_break:
+        ET.SubElement(node, qname(NS_JMI, "tie-break"))
     return node
 
 
@@ -104,7 +108,10 @@ def parse_jmi(xml_or_element: str | ET.Element) -> JMIEvent | None:
                 if child.tag.startswith("{" + NS_JINGLE + "}") and not child.tag.endswith("}text"):
                     reason = child.tag.rsplit("}", 1)[1]
                     break
-        return JMIEvent(action=action, id=sid, media=media, reason=reason)
+        tie_break = node.find(qname(NS_JMI, "tie-break")) is not None
+        return JMIEvent(
+            action=action, id=sid, media=media, reason=reason, tie_break=tie_break
+        )
     return None
 
 
@@ -208,7 +215,7 @@ def build_jingle(
     root = ET.Element(qname(NS_JINGLE, "jingle"), attrs)
 
     if description is not None:
-        mids = description.bundle or tuple(s.mid for s in description.media)
+        mids = description.bundle
         if len(mids) > 1:
             group = ET.SubElement(root, qname(NS_GROUPING, "group"), {"semantics": "BUNDLE"})
             for mid in mids:
@@ -328,9 +335,6 @@ def parse_jingle(xml_or_element: str | ET.Element) -> JingleEvent | None:
             for item in group.findall(qname(NS_GROUPING, "content"))
             if item.attrib.get("name")
         )
-    if not bundle:
-        bundle = tuple(section.mid for section in sections)
-
     reason = None
     reason_node = root.find(qname(NS_JINGLE, "reason"))
     if reason_node is not None:

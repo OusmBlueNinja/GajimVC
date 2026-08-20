@@ -6,7 +6,7 @@ from typing import Any
 import logging
 
 import nbxmpp
-from nbxmpp.protocol import Iq, Message
+from nbxmpp.protocol import Iq, Message, Presence
 from nbxmpp.simplexml import Node
 from nbxmpp.structs import StanzaHandler
 
@@ -65,6 +65,12 @@ class CallsModule(BaseModule):
         from_jid = stanza.getFrom()
         if from_jid is None:
             return
+        log.info(
+            "RX JMI %s sid=%s from=%s",
+            event.action,
+            event.id,
+            from_jid,
+        )
         if _controller.handle_jmi(self._account, str(from_jid), event):
             raise nbxmpp.NodeProcessed
 
@@ -76,7 +82,10 @@ class CallsModule(BaseModule):
         owned = _controller.owns_sid(self._account, event.sid)
         rtp_offer = (
             event.action == "session-initiate"
-            and any(section.media in {"audio", "video"} for section in event.description.media)
+            and any(
+                section.media in {"audio", "video"}
+                for section in event.description.media
+            )
         )
         if not owned and not rtp_offer:
             # Leave non-call Jingle (for example file transfers) to Gajim.
@@ -85,6 +94,14 @@ class CallsModule(BaseModule):
         from_jid = stanza.getFrom()
         if from_jid is None:
             return
+
+        log.info(
+            "RX Jingle %s sid=%s from=%s media=%s",
+            event.action,
+            event.sid,
+            from_jid,
+            ",".join(section.media for section in event.description.media) or "none",
+        )
 
         # Jingle actions are IQ-set and must be acknowledged even when the user
         # has not answered the ringing UI yet.
@@ -122,7 +139,16 @@ class CallsModule(BaseModule):
             )
         )
         message.addChild(node=Node(node=xml_text(store_hint())))
+        log.info("TX JMI %s sid=%s to=%s", action, sid, to_jid)
         self._send(message)
+
+        # XEP-0353 recommends directed presence after <proceed/> if the peers
+        # do not already share presence. Sending it unconditionally is harmless
+        # and is particularly useful for calls between resources of the same
+        # bare JID and contacts without a mutual presence subscription.
+        if action == "proceed":
+            log.info("TX directed presence to=%s", to_jid)
+            self._send(Presence(to=to_jid))
 
     def send_jingle(
         self,
@@ -147,6 +173,7 @@ class CallsModule(BaseModule):
             reason=reason,
         )
         iq.addChild(node=Node(node=xml_text(payload)))
+        log.info("TX Jingle %s sid=%s to=%s", action, sid, to_jid)
         self._send(iq)
 
 

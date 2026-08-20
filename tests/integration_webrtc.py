@@ -139,11 +139,20 @@ def main() -> int:
     def offerer_description(description: SessionDescription) -> None:
         nonlocal offer_seen
         local_descriptions["offerer"] = description
+        # Deliberately flush gathered candidates before the answerer has a
+        # local description. This reproduces Conversations -> Gajim, where
+        # transport-info can arrive while the incoming popup is still ringing.
         flush_candidates("offerer", "answerer")
         if offer_seen:
             return
         offer_seen = True
-        print("offerer: serializing session-initiate Jingle")
+        if len(description.media) < 2:
+            failures.append(
+                "offerer did not produce both audio and video media sections"
+            )
+            loop.quit()
+            return
+        print("offerer: serializing audio/video session-initiate Jingle")
         remote = jingle_round_trip("session-initiate", description)
         peers["answerer"].start_answer(remote)
 
@@ -154,7 +163,13 @@ def main() -> int:
         if answer_seen:
             return
         answer_seen = True
-        print("answerer: serializing session-accept Jingle")
+        if len(description.media) < 2:
+            failures.append(
+                "answerer did not produce both audio and video media sections"
+            )
+            loop.quit()
+            return
+        print("answerer: serializing audio/video session-accept Jingle")
         remote = jingle_round_trip("session-accept", description)
         peers["offerer"].set_remote_answer(remote)
 
@@ -164,8 +179,11 @@ def main() -> int:
     def answerer_candidate(mid: str, candidate: str) -> None:
         deliver_candidate("answerer", "offerer", mid, candidate)
 
+    # Video=True intentionally exercises two m-lines. The old audio-only test
+    # could not detect answerer-side code that accidentally routed every early
+    # remote candidate to m-line 0.
     peers["offerer"] = WebRTCMediaEngine(
-        video=False,
+        video=True,
         on_local_description=offerer_description,
         on_ice_candidate=offerer_candidate,
         on_connected=lambda: ready("offerer"),
@@ -174,7 +192,7 @@ def main() -> int:
         test_mode=True,
     )
     peers["answerer"] = WebRTCMediaEngine(
-        video=False,
+        video=True,
         on_local_description=answerer_description,
         on_ice_candidate=answerer_candidate,
         on_connected=lambda: ready("answerer"),
@@ -188,7 +206,7 @@ def main() -> int:
         loop.quit()
         return GLib.SOURCE_REMOVE
 
-    timeout_id = GLib.timeout_add_seconds(20, timeout)
+    timeout_id = GLib.timeout_add_seconds(25, timeout)
 
     try:
         peers["offerer"].start_offer()
@@ -213,8 +231,8 @@ def main() -> int:
         return 1
 
     print(
-        "Jingle WebRTC loopback OK: session-initiate/session-accept, "
-        "transport-info, trickle ICE, DTLS, and RTP connected"
+        "Jingle WebRTC loopback OK: audio/video session-initiate/session-accept, "
+        "early transport-info, trickle ICE, DTLS, and RTP connected"
     )
     return 0
 

@@ -124,6 +124,7 @@ def parse_sdp(sdp: str) -> SessionDescription:
     media: list[MediaSection] = []
     current: MediaSection | None = None
     codec_maps: list[dict[int, Codec]] = []
+    wildcard_feedback: list[list[tuple[str, str]]] = []
 
     for line in lines:
         if line.startswith("m="):
@@ -136,6 +137,7 @@ def parse_sdp(sdp: str) -> SessionDescription:
             current.fingerprint = session_fp
             media.append(current)
             codec_maps.append({})
+            wildcard_feedback.append([])
             continue
 
         target = current
@@ -230,24 +232,38 @@ def parse_sdp(sdp: str) -> SessionDescription:
             continue
 
         match = _RTCP_FB.match(line)
-        if match and match.group(1) != "*":
+        if match:
+            feedback = (match.group(2), match.group(3) or "")
+            if match.group(1) == "*":
+                wildcard_feedback[-1].append(feedback)
+                continue
             pt = int(match.group(1))
             codec = codec_maps[-1].get(pt)
             if codec is None:
                 continue
-            feedback = codec.rtcp_feedback + (
-                (match.group(2), match.group(3) or ""),
-            )
             codec_maps[-1][pt] = Codec(
                 codec.payload_type,
                 codec.name,
                 codec.clockrate,
                 codec.channels,
                 codec.parameters,
-                feedback,
+                codec.rtcp_feedback + (feedback,),
             )
 
-    for section, mapping in zip(media, codec_maps, strict=True):
+    for section, mapping, wildcard in zip(media, codec_maps, wildcard_feedback, strict=True):
+        if wildcard:
+            for pt, codec in list(mapping.items()):
+                merged = codec.rtcp_feedback + tuple(
+                    feedback for feedback in wildcard if feedback not in codec.rtcp_feedback
+                )
+                mapping[pt] = Codec(
+                    codec.payload_type,
+                    codec.name,
+                    codec.clockrate,
+                    codec.channels,
+                    codec.parameters,
+                    merged,
+                )
         section.codecs = list(mapping.values())
         if section.fingerprint is None:
             section.fingerprint = session_fp

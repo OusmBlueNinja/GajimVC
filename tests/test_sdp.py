@@ -25,6 +25,7 @@ a=ice-ufrag:ghi
 a=ice-pwd:jklmnopqrstuv
 a=rtcp-mux
 a=sendrecv
+a=rtcp-fb:* nack pli
 a=rtpmap:96 VP8/90000
 a=rtcp-fb:96 nack
 a=rtcp-fb:96 nack pli
@@ -58,6 +59,31 @@ def test_sdp_parse_and_build_round_trip():
     assert again.media[0].ice_ufrag == "abc"
     assert again.media[0].fingerprint is not None
     assert again.media[0].fingerprint.value == "AA:BB:CC"
+    assert ("nack", "pli") in again.media[1].codecs[0].rtcp_feedback
+
+
+def test_wildcard_rtcp_feedback_applies_to_every_payload_even_before_rtpmap():
+    sample = """v=0
+ o=- 1 1 IN IP4 127.0.0.1
+ s=-
+ t=0 0
+ m=video 9 UDP/TLS/RTP/SAVPF 96 97
+ c=IN IP4 0.0.0.0
+ a=mid:video
+ a=rtcp-fb:* nack pli
+ a=rtpmap:96 VP8/90000
+ a=rtpmap:97 VP9/90000
+ """.replace("\n ", "\n")
+    description = parse_sdp(sample)
+    assert len(description.media[0].codecs) == 2
+    assert all(
+        ("nack", "pli") in codec.rtcp_feedback
+        for codec in description.media[0].codecs
+    )
+
+    rebuilt = build_sdp(description)
+    assert "a=rtcp-fb:96 nack pli\r\n" in rebuilt
+    assert "a=rtcp-fb:97 nack pli\r\n" in rebuilt
 
 
 def test_sdp_without_bundle_stays_unbundled():

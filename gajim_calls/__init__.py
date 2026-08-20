@@ -28,6 +28,9 @@ def __getattr__(name: str) -> Any:
     runtime_controller = getattr(plugin_module, "RuntimeCallController", None)
     if runtime_controller is not None:
         from .call_waiting import with_call_waiting
+        from .jmi_migration import with_jmi_migration
 
-        plugin_module.RuntimeCallController = with_call_waiting(runtime_controller)
+        plugin_module.RuntimeCallController = with_jmi_migration(
+            with_call_waiting(runtime_controller)
+        )
     return plugin_module.GajimCallsPlugin

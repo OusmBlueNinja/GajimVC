@@ -14,6 +14,7 @@ from gajim.common.modules.base import BaseModule
 
 from .constants import NS_JINGLE, NS_JMI
 from .incoming import should_claim_jingle
+from .jmi_migration import add_migrated_element
 from .protocol import (
     build_jingle,
     build_jmi,
@@ -155,21 +156,19 @@ class CallsModule(BaseModule):
         media: tuple[str, ...] = (),
         reason: str | None = None,
         tie_break: bool = False,
+        migrated_to: str | None = None,
     ) -> None:
         message = Message(to=to_jid, typ="chat")
-        message.addChild(
-            node=Node(
-                node=xml_text(
-                    build_jmi(
-                        action,
-                        sid,
-                        media=media,
-                        reason=reason,
-                        tie_break=tie_break,
-                    )
-                )
-            )
+        payload = build_jmi(
+            action,
+            sid,
+            media=media,
+            reason=reason,
+            tie_break=tie_break,
         )
+        if migrated_to is not None:
+            add_migrated_element(payload, migrated_to)
+        message.addChild(node=Node(node=xml_text(payload)))
         message.addChild(node=Node(node=xml_text(store_hint())))
         log.info("TX JMI %s sid=%s to=%s", action, sid, to_jid)
         self._send(message)

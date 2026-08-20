@@ -87,21 +87,36 @@ class WebRTCMediaEngine(_BaseWebRTCMediaEngine):
         except (ValueError, TypeError):
             return False
 
-    def _on_local_offer_set(self, promise, offer, _notify) -> None:
+    def _current_local_description(self, kind: str):
+        # Do not retain the temporary WebRTCSessionDescription passed as the
+        # GstPromise user data. PyGObject can invalidate that wrapper by the
+        # time the async operation completes. webrtcbin owns the negotiated
+        # local-description and is the authoritative object after completion.
+        local = self.webrtc.get_property("local-description")
+        if local is None or local.sdp is None:
+            self._fail(f"GStreamer stored no local WebRTC {kind}")
+            return None
+        return parse_sdp(local.sdp.as_text())
+
+    def _on_local_offer_set(self, promise, _offer, _notify) -> None:
         error = self._reply_error(promise.get_reply())
         if error is not None:
             self._fail(f"Could not set local WebRTC offer: {error}")
             return
-        description = parse_sdp(offer.sdp.as_text())
+        description = self._current_local_description("offer")
+        if description is None:
+            return
         self._state("local offer ready")
         self._dispatch(self._on_local_description, description)
 
-    def _on_local_answer_set(self, promise, answer, _notify) -> None:
+    def _on_local_answer_set(self, promise, _answer, _notify) -> None:
         error = self._reply_error(promise.get_reply())
         if error is not None:
             self._fail(f"Could not set local WebRTC answer: {error}")
             return
-        description = parse_sdp(answer.sdp.as_text())
+        description = self._current_local_description("answer")
+        if description is None:
+            return
         self._state("local answer ready")
         self._dispatch(self._on_local_description, description)
 
@@ -128,7 +143,7 @@ class WebRTCMediaEngine(_BaseWebRTCMediaEngine):
         self._local_candidate_count += 1
         local = self.webrtc.get_property("local-description")
         mid = str(mline_index)
-        if local is not None:
+        if local is not None and local.sdp is not None:
             parsed = parse_sdp(local.sdp.as_text())
             if mline_index < len(parsed.media):
                 mid = parsed.media[mline_index].mid

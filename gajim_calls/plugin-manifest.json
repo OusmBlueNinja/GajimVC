@@ -16,5 +16,5 @@
     "gajim>=2.4.2,<2.6.0"
   ],
   "short_name": "gajim_calls",
-  "version": "0.1.6"
+  "version": "0.1.7"
 }

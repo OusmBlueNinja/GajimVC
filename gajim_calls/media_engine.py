@@ -16,12 +16,18 @@ from .media import (
     MediaUnavailable,
     WebRTCMediaEngine as _BaseWebRTCMediaEngine,
     probe_runtime,
+    probe_video_runtime,
 )
 from .sdp import IceCandidate, SessionDescription, parse_sdp
 
 log = logging.getLogger("gajim.p.gajim_calls.media")
 
-__all__ = ["MediaUnavailable", "WebRTCMediaEngine", "probe_runtime"]
+__all__ = [
+    "MediaUnavailable",
+    "WebRTCMediaEngine",
+    "probe_runtime",
+    "probe_video_runtime",
+]
 
 
 def _idle(callback: Callable, *args) -> None:
@@ -41,8 +47,6 @@ class _HardenedWebRTCMediaEngine(_BaseWebRTCMediaEngine):
     """Actual GStreamer engine with Jingle/GTK interoperability fixes."""
 
     def __init__(self, *args, **kwargs) -> None:
-        # The base media code's decoded-pad signal is emitted from a GStreamer
-        # streaming thread. Never let its GTK paintable callback touch GTK there.
         remote_video = kwargs.get("on_remote_video")
         if remote_video is not None:
             kwargs["on_remote_video"] = lambda paintable: _idle(remote_video, paintable)
@@ -56,7 +60,6 @@ class _HardenedWebRTCMediaEngine(_BaseWebRTCMediaEngine):
 
         super().__init__(*args, **kwargs)
 
-        # BALANCED is not implemented by some current webrtcbin builds.
         try:
             self.webrtc.set_property(
                 "bundle-policy", self.GstWebRTC.WebRTCBundlePolicy.MAX_BUNDLE
@@ -70,8 +73,6 @@ class _HardenedWebRTCMediaEngine(_BaseWebRTCMediaEngine):
 
     @staticmethod
     def _reply_error(reply) -> str | None:
-        # set-local-description/set-remote-description may complete successfully
-        # with a NULL GstStructure reply.
         if reply is None:
             return None
         try:
@@ -154,13 +155,7 @@ class _HardenedWebRTCMediaEngine(_BaseWebRTCMediaEngine):
         elif name in {"failed", "closed"}:
             self._fail(f"WebRTC connection state: {name}")
 
-    def _on_local_ice(
-        self, element, mline_index: int, candidate: str
-    ) -> None:
-        # Conversations/libwebrtc can exchange UDP and TCP ICE candidates in
-        # Jingle. The previous compatibility layer discarded every TCP
-        # candidate, which removed viable host/relay paths on restrictive
-        # networks before ICE could test them.
+    def _on_local_ice(self, element, mline_index: int, candidate: str) -> None:
         self._record_candidate("local", candidate)
         super()._on_local_ice(element, mline_index, candidate)
 
@@ -169,9 +164,6 @@ class _HardenedWebRTCMediaEngine(_BaseWebRTCMediaEngine):
         super().add_remote_candidate(mid, candidate)
 
     def _on_decoded_pad(self, decode, pad) -> None:
-        # gtk4paintablesink/gtksink create GTK/GDK objects. GStreamer's
-        # decodebin emits pad-added from a streaming thread, so video sink setup
-        # must be moved to GTK's main context. Audio has no GTK objects.
         caps = pad.get_current_caps() or pad.query_caps(None)
         text = caps.to_string() if caps is not None else ""
         if text.startswith("video/") and not self._test_mode:
@@ -184,12 +176,7 @@ class _HardenedWebRTCMediaEngine(_BaseWebRTCMediaEngine):
 
 
 class WebRTCMediaEngine:
-    """Non-blocking facade around the GStreamer media engine.
-
-    GStreamer device probing and state changes can take long enough on Windows
-    to starve GTK. Construction/start/close therefore happen on a daemon worker
-    while all application callbacks are marshalled back to GLib's main loop.
-    """
+    """Non-blocking facade around the GStreamer media engine."""
 
     def __init__(
         self,
@@ -237,7 +224,6 @@ class WebRTCMediaEngine:
             answer = self._pending_answer
             self._pending_answer = None
 
-        # Signal Jingle first; only then apply a very-early remote answer.
         self._user_local_description(description)
         if engine is not None and answer is not None:
             engine.set_remote_answer(answer)
@@ -344,8 +330,6 @@ class WebRTCMediaEngine:
         if engine is None:
             return
 
-        # State -> NULL can block while Windows audio/video devices unwind.
-        # Never make the GTK close-request callback wait for that.
         threading.Thread(
             target=engine.close,
             name="gajim-calls-media-stop",

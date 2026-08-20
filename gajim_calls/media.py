@@ -34,6 +34,10 @@ def _load_gst():
     return Gst, GstSdp, GstWebRTC
 
 
+def _missing_elements(Gst, names: tuple[str, ...]) -> list[str]:
+    return [name for name in names if Gst.ElementFactory.find(name) is None]
+
+
 def probe_runtime() -> tuple[bool, str]:
     try:
         Gst, _, _ = _load_gst()
@@ -48,20 +52,41 @@ def probe_runtime() -> tuple[bool, str]:
         "autoaudiosink",
         "decodebin",
     )
-    missing = [
-        name for name in required if Gst.ElementFactory.find(name) is None
-    ]
+    missing = _missing_elements(Gst, required)
     if missing:
         return False, "Missing GStreamer elements: " + ", ".join(missing)
 
-    # webrtcbin relies on libnice for ICE. Some Windows GStreamer bundles can
-    # contain webrtcbin while the libnice plugin itself is absent.
     if (
         Gst.ElementFactory.find("nicesrc") is None
         or Gst.ElementFactory.find("nicesink") is None
     ):
         return False, "GStreamer libnice ICE plugin is missing (nicesrc/nicesink)"
 
+    return True, ""
+
+
+def probe_video_runtime() -> tuple[bool, str]:
+    """Check the concrete VP8 capture/send/receive pieces we advertise."""
+    ok, reason = probe_runtime()
+    if not ok:
+        return False, reason
+    try:
+        Gst, _, _ = _load_gst()
+    except MediaUnavailable as exc:
+        return False, str(exc)
+
+    required = (
+        "autovideosrc",
+        "videoconvert",
+        "videoscale",
+        "vp8enc",
+        "rtpvp8pay",
+        "rtpvp8depay",
+        "vp8dec",
+    )
+    missing = _missing_elements(Gst, required)
+    if missing:
+        return False, "Missing GStreamer video elements: " + ", ".join(missing)
     return True, ""
 
 
@@ -237,11 +262,6 @@ class WebRTCMediaEngine:
         self._add_remote_candidate_now(mid, candidate)
 
     def _add_remote_candidate_now(self, mid: str, candidate: str) -> None:
-        # The m-line index for a *remote* ICE candidate belongs to the remote
-        # SDP. This matters on the answerer path: Conversations can trickle
-        # candidates immediately after session-initiate, before we have created
-        # a local answer. Looking at local-description there made every early
-        # candidate fall back to m-line 0 and broke multi-stream incoming calls.
         index: int | None = None
         remote = self.webrtc.get_property("remote-description")
         if remote is not None and remote.sdp is not None:
@@ -251,10 +271,6 @@ class WebRTCMediaEngine:
                     index = idx
                     break
 
-        # A remote description should always exist once
-        # _remote_description_set is true. Keep a conservative fallback for
-        # unusual GStreamer builds, but never silently route an unknown MID to
-        # the first media section when multiple sections exist.
         if index is None:
             local = self.webrtc.get_property("local-description")
             if local is not None and local.sdp is not None:

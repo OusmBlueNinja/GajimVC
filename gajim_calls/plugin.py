@@ -16,9 +16,10 @@ from gajim.plugins import GajimPlugin
 from . import controller as controller_module
 from . import module
 from .alerts import IncomingCallAlerts
+from .capabilities import extend_call_capabilities
 from .controller_runtime import RuntimeCallController
 from .gtk.config import ConfigDialog
-from .media_engine import WebRTCMediaEngine, probe_runtime
+from .media_engine import WebRTCMediaEngine, probe_runtime, probe_video_runtime
 
 log = logging.getLogger("gajim.p.gajim_calls")
 
@@ -44,7 +45,8 @@ class GajimCallsPlugin(GajimPlugin):
             "message_actions_box": (
                 self._message_actions_box_created,
                 self._message_actions_box_destroyed,
-            )
+            ),
+            "update_caps": (self._update_caps, None),
         }
         self._toolbar_entry: tuple[
             MessageActionsBox, Gtk.Widget, Gtk.Button
@@ -55,6 +57,7 @@ class GajimCallsPlugin(GajimPlugin):
         self._startup_retry_attempts = 0
         self._call_active = False
         self._call_connected = False
+        self._video_available = False
         self._css_provider: Gtk.CssProvider | None = None
         self._install_css()
 
@@ -62,6 +65,11 @@ class GajimCallsPlugin(GajimPlugin):
         if not ok:
             self.activatable = False
             self.available_text = reason
+            return
+
+        self._video_available, video_reason = probe_video_runtime()
+        if not self._video_available:
+            log.info("Video calls will not be advertised: %s", video_reason)
 
     def _install_css(self) -> None:
         display = Gdk.Display.get_default()
@@ -76,12 +84,33 @@ class GajimCallsPlugin(GajimPlugin):
         )
         self._css_provider = provider
 
+    def _update_caps(self, _account: str, features: list[str]) -> None:
+        extend_call_capabilities(features, video=self._video_available)
+
+    @staticmethod
+    def _refresh_caps() -> None:
+        try:
+            accounts = app.settings.get_active_accounts()
+        except Exception:
+            log.debug("Could not enumerate accounts while refreshing caps", exc_info=True)
+            return
+        for account in accounts:
+            try:
+                app.get_client(account).get_module("Caps").update_caps()
+            except Exception:
+                log.debug("Could not refresh call caps for account %s", account, exc_info=True)
+
+    @classmethod
+    def _refresh_caps_idle(cls) -> bool:
+        cls._refresh_caps()
+        return GLib.SOURCE_REMOVE
+
     def activate(self) -> None:
         log.info("Gajim Calls activated")
-        # Extension points are normally called when a chat is created, but a
-        # plugin can also be loaded after Gajim has already restored a chat.
-        # Discover that existing MessageActionsBox during startup as well.
         self._schedule_startup_registration()
+        # Recalculate XEP-0115 immediately so already-connected resources expose
+        # this plugin's Jingle features instead of waiting for a future presence.
+        self._refresh_caps()
 
     def deactivate(self) -> None:
         self.incoming_alerts.stop()
@@ -89,6 +118,9 @@ class GajimCallsPlugin(GajimPlugin):
         self._cancel_startup_retry()
         self._remove_toolbar_control()
         module.set_controller(None)
+        # Run after the plugin manager finishes removing the update_caps hook,
+        # so contacts no longer see stale call support after disabling plugin.
+        GLib.idle_add(self._refresh_caps_idle)
 
     def incoming_call_started(
         self, account: str, sid: str, peer: str, *, video: bool
@@ -131,7 +163,6 @@ class GajimCallsPlugin(GajimPlugin):
         return fallback
 
     def _find_chat_toolbar_target(self) -> tuple[Gtk.Widget | None, Gtk.Widget | None]:
-        """Find the conversation toolbar containing Search and Chat Details."""
         try:
             root = app.window
         except Exception:
@@ -228,7 +259,6 @@ class GajimCallsPlugin(GajimPlugin):
         self._toolbar_retry_attempts = 0
 
     def _attach_toolbar_control(self) -> bool:
-        """Attach beside the chat controls, retrying while Gajim builds its UI."""
         entry = self._toolbar_entry
         if entry is None:
             self._toolbar_retry_id = None
@@ -241,9 +271,6 @@ class GajimCallsPlugin(GajimPlugin):
             toolbar, "insert_child_after"
         ):
             self._detach(button)
-            # GtkBox insert_child_after inserts after the supplied sibling. To
-            # put Call immediately LEFT of Search, insert after Search's prior
-            # sibling (or prepend when Search is the first item).
             previous = search_button.get_prev_sibling()
             if previous is None and hasattr(toolbar, "prepend"):
                 toolbar.prepend(button)
@@ -268,9 +295,6 @@ class GajimCallsPlugin(GajimPlugin):
 
     def _schedule_toolbar_attach(self) -> None:
         self._cancel_toolbar_retry()
-        # Gajim can create MessageActionsBox before the visible conversation
-        # header after a cold restart. Retry for up to ~10 seconds instead of
-        # losing the button for the whole app session.
         if self._attach_toolbar_control():
             self._toolbar_retry_id = GLib.timeout_add(250, self._attach_toolbar_control)
 
@@ -284,7 +308,6 @@ class GajimCallsPlugin(GajimPlugin):
         self._detach(button)
 
     def set_call_active(self, active: bool, *, connected: bool = False) -> None:
-        """Swap the chat-toolbar action between call, cancel, and hang-up states."""
         self._call_active = active
         self._call_connected = active and connected
         if self._toolbar_entry is None:
@@ -348,8 +371,6 @@ class GajimCallsPlugin(GajimPlugin):
         if entry is None or entry[0] is not message_actions_box:
             return
         self._remove_toolbar_control()
-        # If Gajim is swapping restored/current chats, discover the replacement
-        # even if its extension callback raced with the destruction callback.
         self._schedule_startup_registration()
 
     def _on_call_button_clicked(self, message_actions_box: MessageActionsBox) -> None:

@@ -22,6 +22,9 @@ def __getattr__(name: str) -> Any:
         raise AttributeError(name)
 
     from . import plugin as plugin_module
+    from .runtime_features import install_runtime_features
+
+    install_runtime_features(plugin_module)
 
     # Discovery tests and lightweight loaders can provide only the plugin
     # class. Compose runtime-only behaviour when the real controller exists.

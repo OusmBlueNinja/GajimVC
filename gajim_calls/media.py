@@ -237,14 +237,43 @@ class WebRTCMediaEngine:
         self._add_remote_candidate_now(mid, candidate)
 
     def _add_remote_candidate_now(self, mid: str, candidate: str) -> None:
-        index = 0
-        local = self.webrtc.get_property("local-description")
-        if local is not None:
-            parsed = parse_sdp(local.sdp.as_text())
+        # The m-line index for a *remote* ICE candidate belongs to the remote
+        # SDP. This matters on the answerer path: Conversations can trickle
+        # candidates immediately after session-initiate, before we have created
+        # a local answer. Looking at local-description there made every early
+        # candidate fall back to m-line 0 and broke multi-stream incoming calls.
+        index: int | None = None
+        remote = self.webrtc.get_property("remote-description")
+        if remote is not None and remote.sdp is not None:
+            parsed = parse_sdp(remote.sdp.as_text())
             for idx, section in enumerate(parsed.media):
                 if section.mid == mid:
                     index = idx
                     break
+
+        # A remote description should always exist once
+        # _remote_description_set is true. Keep a conservative fallback for
+        # unusual GStreamer builds, but never silently route an unknown MID to
+        # the first media section when multiple sections exist.
+        if index is None:
+            local = self.webrtc.get_property("local-description")
+            if local is not None and local.sdp is not None:
+                parsed = parse_sdp(local.sdp.as_text())
+                for idx, section in enumerate(parsed.media):
+                    if section.mid == mid:
+                        index = idx
+                        break
+                if index is None and len(parsed.media) == 1:
+                    index = 0
+
+        if index is None:
+            log.warning(
+                "Ignoring remote ICE candidate with unknown MID %s instead of "
+                "routing it to the wrong m-line",
+                mid,
+            )
+            return
+
         log.info("Adding remote ICE candidate mid=%s mline=%d", mid, index)
         self.webrtc.emit("add-ice-candidate", index, candidate)
 

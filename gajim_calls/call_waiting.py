@@ -13,6 +13,7 @@ from .state import CallContext, CallState
 log = logging.getLogger("gajim.p.gajim_calls.call_waiting")
 
 _TERMINAL = {CallState.ENDED, CallState.FAILED}
+_WAITING_TIMEOUT_SECONDS = 60
 T = TypeVar("T")
 
 
@@ -28,6 +29,8 @@ def with_call_waiting(base: type[T]) -> type[T]:
             super().__init__(plugin)
             self._waiting_context: CallContext | None = None
             self._waiting_offer: SessionDescription | None = None
+            self._waiting_timeout_id: int | None = None
+            self._waiting_timeout_sid: str | None = None
 
         @property
         def waiting_context(self) -> CallContext | None:
@@ -35,6 +38,9 @@ def with_call_waiting(base: type[T]) -> type[T]:
 
         def _is_active(self) -> bool:
             return self.context is not None and self.context.state not in _TERMINAL
+
+        def _is_connected(self) -> bool:
+            return self.context is not None and self.context.state == CallState.CONNECTED
 
         def owns_sid(self, account: str, sid: str) -> bool:
             if super().owns_sid(account, sid):
@@ -62,6 +68,46 @@ def with_call_waiting(base: type[T]) -> type[T]:
                     incoming=True,
                 )
             return super().accepts_jingle_sender(account, sid, sender, action)
+
+        def _cancel_waiting_timeout(self) -> None:
+            source_id = self._waiting_timeout_id
+            self._waiting_timeout_id = None
+            self._waiting_timeout_sid = None
+            if source_id is None:
+                return
+            try:
+                from gi.repository import GLib
+
+                GLib.source_remove(source_id)
+            except Exception:
+                log.debug("Unable to remove waiting-call timeout", exc_info=True)
+
+        def _arm_waiting_timeout(self, sid: str) -> None:
+            self._cancel_waiting_timeout()
+            self._waiting_timeout_sid = sid
+            try:
+                from gi.repository import GLib
+
+                self._waiting_timeout_id = GLib.timeout_add_seconds(
+                    _WAITING_TIMEOUT_SECONDS,
+                    self._on_waiting_timeout,
+                    sid,
+                )
+            except (ImportError, ModuleNotFoundError):
+                # Headless unit tests deliberately run without PyGObject. They
+                # invoke _on_waiting_timeout synchronously instead.
+                self._waiting_timeout_id = None
+
+        def _on_waiting_timeout(self, sid: str) -> bool:
+            if self._waiting_timeout_sid == sid:
+                self._waiting_timeout_id = None
+                self._waiting_timeout_sid = None
+            waiting = self._waiting_context
+            if waiting is None or waiting.sid != sid:
+                return False
+            log.info("Waiting call timed out sid=%s peer=%s", sid, waiting.peer_bare)
+            self._decline_waiting(reason="timeout")
+            return False
 
         def _start_waiting_alert(self, context: CallContext) -> None:
             callback = getattr(self.plugin, "incoming_call_started", None)
@@ -103,6 +149,10 @@ def with_call_waiting(base: type[T]) -> type[T]:
 
             self._start_waiting_alert(waiting)
             self._get_window().show_incoming(waiting.peer_bare, waiting.has_video)
+            # show_incoming() marks the toolbar as a not-yet-connected call.
+            # The original connected call is still live until Accept is clicked.
+            self._restore_active_indicator()
+            self._arm_waiting_timeout(sid)
             log.info("Incoming call waiting sid=%s peer=%s", sid, waiting.peer_bare)
 
         def _restore_active_indicator(self) -> None:
@@ -118,6 +168,7 @@ def with_call_waiting(base: type[T]) -> type[T]:
             waiting = self._waiting_context
             if waiting is None:
                 return
+            self._cancel_waiting_timeout()
             self._stop_incoming_alerts(waiting.sid)
             self._early_remote_candidates.discard(waiting.sid)
             self._waiting_context = None
@@ -133,16 +184,23 @@ def with_call_waiting(base: type[T]) -> type[T]:
                 return
             module = self._module(waiting.account)
             target = waiting.peer_full or waiting.peer_bare
-            if waiting.metadata.get("signaling") == "jmi":
-                module.send_jmi(target, "reject", waiting.sid, reason=reason)
-            elif waiting.peer_full is not None:
-                module.send_jingle(
-                    waiting.peer_full,
-                    "session-terminate",
+            try:
+                if waiting.metadata.get("signaling") == "jmi":
+                    module.send_jmi(target, "reject", waiting.sid, reason=reason)
+                elif waiting.peer_full is not None:
+                    module.send_jingle(
+                        waiting.peer_full,
+                        "session-terminate",
+                        waiting.sid,
+                        initiator=waiting.initiator or waiting.peer_full,
+                        responder=waiting.responder or self._own_jid(waiting.account),
+                        reason="decline" if reason == "busy" else reason,
+                    )
+            except Exception:
+                log.exception(
+                    "Unable to decline waiting call sid=%s reason=%s",
                     waiting.sid,
-                    initiator=waiting.initiator or waiting.peer_full,
-                    responder=waiting.responder or self._own_jid(waiting.account),
-                    reason="decline" if reason == "busy" else reason,
+                    reason,
                 )
             self._clear_waiting()
 
@@ -244,7 +302,7 @@ def with_call_waiting(base: type[T]) -> type[T]:
                 )
                 if same_peer_tie_break:
                     return super().handle_jmi(account, from_jid, event)
-                if waiting is not None:
+                if context.state != CallState.CONNECTED or waiting is not None:
                     self._reject_extra_call(account, from_jid, event)
                     return True
                 media = tuple(
@@ -286,7 +344,7 @@ def with_call_waiting(base: type[T]) -> type[T]:
                 and self._is_active()
                 and (self.context is None or event.sid != self.context.sid)
             ):
-                if waiting is not None:
+                if not self._is_connected() or waiting is not None:
                     self._reject_extra_call(account, from_jid, event)
                     return
                 media = tuple(
@@ -310,6 +368,7 @@ def with_call_waiting(base: type[T]) -> type[T]:
             waiting = self._waiting_context
             if waiting is not None:
                 offer = self._waiting_offer
+                self._cancel_waiting_timeout()
                 self._stop_incoming_alerts(waiting.sid)
                 self._end_active_for_switch()
                 self.context = waiting
@@ -327,25 +386,27 @@ def with_call_waiting(base: type[T]) -> type[T]:
 
         def _finish_local(self, state: CallState, *, hide: bool = True) -> None:
             waiting = self._waiting_context
-            waiting_items = None
-            if waiting is not None:
-                waiting_items = self._early_remote_candidates._items.pop(  # noqa: SLF001
-                    waiting.sid, None
-                )
+            waiting_offer = self._waiting_offer
             super()._finish_local(state, hide=hide)
             if waiting is not None:
-                if waiting_items:
-                    self._early_remote_candidates._items[waiting.sid] = waiting_items  # noqa: SLF001
-                self.context = None
+                self._cancel_waiting_timeout()
+                # The active call ended while another caller was waiting. Make
+                # that call the normal ringing context instead of leaving a
+                # special waiting state behind.
+                self.context = waiting
+                self._pending_offer = waiting_offer
+                self._waiting_context = None
+                self._waiting_offer = None
                 self._get_window().show_incoming(
                     waiting.peer_bare, waiting.has_video
                 )
-                self._restore_active_indicator()
+                self._arm_phase_timeout("ringing")
 
         def _cleanup(self, terminal: bool = True) -> None:
             waiting = self._waiting_context
             if waiting is not None:
                 self._stop_incoming_alerts(waiting.sid)
+            self._cancel_waiting_timeout()
             self._waiting_context = None
             self._waiting_offer = None
             super()._cleanup(terminal=terminal)

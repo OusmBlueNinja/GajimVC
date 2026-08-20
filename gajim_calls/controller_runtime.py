@@ -264,8 +264,6 @@ class RuntimeCallController(CallController):
         context = self.context
         if event.action == "session-initiate":
             if context is not None and context.sid == event.sid:
-                # Treat the authenticated stanza sender as the initiator unless
-                # another protocol explicitly authorizes redirection.
                 if context.incoming:
                     context.peer_full = from_jid
                     context.initiator = from_jid
@@ -460,7 +458,9 @@ class RuntimeCallController(CallController):
         context = self.context
         if context is not None:
             self._stop_incoming_alerts(context.sid)
-        self._early_remote_candidates.clear()
+            # Candidate buffering is SID-scoped. Discard only the call that is
+            # ending so a call-waiting layer can safely preserve another SID.
+            self._early_remote_candidates.discard(context.sid)
         super()._finish_local(state, hide=hide)
 
     def _cleanup(self, terminal: bool = True) -> None:

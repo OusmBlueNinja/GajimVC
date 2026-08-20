@@ -14,7 +14,10 @@ import gi  # noqa: E402
 gi.require_version("GLib", "2.0")
 from gi.repository import GLib  # noqa: E402
 
-from gajim_calls.media import WebRTCMediaEngine, probe_runtime  # noqa: E402
+from gajim_calls.media_engine import (  # noqa: E402
+    WebRTCMediaEngine,
+    probe_runtime,
+)
 
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")

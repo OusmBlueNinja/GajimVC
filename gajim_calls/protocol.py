@@ -215,9 +215,14 @@ def build_jingle(
     root = ET.Element(qname(NS_JINGLE, "jingle"), attrs)
 
     if description is not None:
+        # XEP-0338 maps the SDP group exactly to a Jingle group. A WebRTC
+        # audio-only description can legitimately contain a one-member BUNDLE
+        # group; dropping it changes the negotiated description on the wire.
         mids = description.bundle
-        if len(mids) > 1:
-            group = ET.SubElement(root, qname(NS_GROUPING, "group"), {"semantics": "BUNDLE"})
+        if mids:
+            group = ET.SubElement(
+                root, qname(NS_GROUPING, "group"), {"semantics": "BUNDLE"}
+            )
             for mid in mids:
                 ET.SubElement(group, qname(NS_GROUPING, "content"), {"name": mid})
         for section in description.media:

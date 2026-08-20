@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end Jingle + ICE/DTLS smoke test with real GStreamer peers."""
+"""End-to-end Jingle + ICE/DTLS smoke tests with real GStreamer peers."""
 
 from __future__ import annotations
 
@@ -22,16 +22,19 @@ from gajim_calls.sdp import IceCandidate, MediaSection, SessionDescription  # no
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
-SID = "ci-jingle-webrtc-loopback"
 INITIATOR = "offerer@example.test/desktop"
 RESPONDER = "answerer@example.test/phone"
 
 
-def jingle_event_round_trip(action: str, description: SessionDescription) -> JingleEvent:
+def jingle_event_round_trip(
+    action: str,
+    sid: str,
+    description: SessionDescription,
+) -> JingleEvent:
     """Serialize exactly as the plugin does, then parse like the receiving peer."""
     payload = build_jingle(
         action,
-        SID,
+        sid,
         initiator=INITIATOR,
         responder=RESPONDER,
         description=description,
@@ -40,18 +43,20 @@ def jingle_event_round_trip(action: str, description: SessionDescription) -> Jin
     event = parse_jingle(xml_text(payload))
     if event is None:
         raise RuntimeError(f"Could not parse generated {action} Jingle XML")
-    if event.action != action or event.sid != SID:
+    if event.action != action or event.sid != sid:
         raise RuntimeError(
             f"Jingle round-trip mismatch: action={event.action!r} sid={event.sid!r}"
+        )
+    if event.description.bundle != description.bundle:
+        raise RuntimeError(
+            f"Jingle {action} changed BUNDLE {description.bundle!r} "
+            f"to {event.description.bundle!r}"
         )
     return event
 
 
-def jingle_round_trip(action: str, description: SessionDescription) -> SessionDescription:
-    return jingle_event_round_trip(action, description).description
-
-
 def candidate_event_round_trip(
+    sid: str,
     local_description: SessionDescription,
     mid: str,
     candidate_text: str,
@@ -75,16 +80,14 @@ def candidate_event_round_trip(
     )
     return jingle_event_round_trip(
         "transport-info",
+        sid,
         SessionDescription(media=[section], bundle=()),
     )
 
 
-def main() -> int:
-    ok, reason = probe_runtime()
-    if not ok:
-        print(f"Runtime probe failed: {reason}", file=sys.stderr)
-        return 2
-
+def run_case(*, video: bool) -> list[str]:
+    label = "audio-video" if video else "audio-only"
+    sid = f"ci-jingle-webrtc-{label}"
     loop = GLib.MainLoop()
     connected: set[str] = set()
     failures: list[str] = []
@@ -98,37 +101,41 @@ def main() -> int:
     pre_session_ice = RemoteCandidateBuffer()
     answerer_started = False
     offer_description: SessionDescription | None = None
+    expected_media = 2 if video else 1
 
     def state(peer: str, value: str) -> None:
-        line = f"{peer}: {value}"
+        line = f"{label}/{peer}: {value}"
         states.append(line)
         print(line)
 
     def failed(peer: str, reason: str) -> None:
-        failures.append(f"{peer}: {reason}")
+        failures.append(f"{label}/{peer}: {reason}")
         loop.quit()
 
     def ready(peer: str) -> None:
         connected.add(peer)
-        print(f"{peer}: CONNECTED")
+        print(f"{label}/{peer}: CONNECTED")
         if connected == {"offerer", "answerer"}:
             loop.quit()
+
+    def round_trip(action: str, description: SessionDescription) -> SessionDescription:
+        return jingle_event_round_trip(action, sid, description).description
 
     def start_answer_after_pre_session_ice() -> None:
         nonlocal answerer_started
         if answerer_started or offer_description is None:
             return
-        if pre_session_ice.count(SID) == 0:
+        if pre_session_ice.count(sid) == 0:
             return
 
         answerer_started = True
-        print("answerer: receiving session-initiate after pre-session transport-info")
-        remote = jingle_round_trip("session-initiate", offer_description)
+        print(f"{label}/answerer: receiving session-initiate after pre-session ICE")
+        remote = round_trip("session-initiate", offer_description)
         peers["answerer"].start_answer(remote)
-        flushed = pre_session_ice.flush_to(peers["answerer"], SID)
-        print(f"answerer: applied {flushed} pre-session ICE candidate(s)")
+        flushed = pre_session_ice.flush_to(peers["answerer"], sid)
+        print(f"{label}/answerer: applied {flushed} pre-session ICE candidate(s)")
         if flushed == 0:
-            failures.append("pre-session ICE buffer was not exercised")
+            failures.append(f"{label}: pre-session ICE buffer was not exercised")
             loop.quit()
 
     def deliver_candidate(source: str, target: str, mid: str, candidate: str) -> None:
@@ -137,12 +144,10 @@ def main() -> int:
             queued_candidates[source].append((mid, candidate))
             return
 
-        event = candidate_event_round_trip(local, mid, candidate)
+        event = candidate_event_round_trip(sid, local, mid, candidate)
         if source == "offerer" and target == "answerer" and not answerer_started:
             added = pre_session_ice.add_event(event)
-            print(
-                f"answerer: buffered {added} ICE candidate(s) before session-initiate"
-            )
+            print(f"{label}/answerer: buffered {added} ICE before session-initiate")
             start_answer_after_pre_session_ice()
             return
 
@@ -162,14 +167,15 @@ def main() -> int:
         nonlocal offer_description
         local_descriptions["offerer"] = description
         if offer_description is None:
-            if len(description.media) < 2:
+            if len(description.media) != expected_media:
                 failures.append(
-                    "offerer did not produce both audio and video media sections"
+                    f"{label}: offerer produced {len(description.media)} media sections, "
+                    f"expected {expected_media}"
                 )
                 loop.quit()
                 return
             offer_description = description
-            print("offerer: local audio/video offer ready; waiting for first ICE candidate")
+            print(f"{label}/offerer: local offer ready; waiting for first ICE candidate")
         flush_candidates("offerer", "answerer")
 
     def answerer_description_ready(description: SessionDescription) -> None:
@@ -179,39 +185,34 @@ def main() -> int:
         if answer_seen:
             return
         answer_seen = True
-        if len(description.media) < 2:
+        if len(description.media) != expected_media:
             failures.append(
-                "answerer did not produce both audio and video media sections"
+                f"{label}: answerer produced {len(description.media)} media sections, "
+                f"expected {expected_media}"
             )
             loop.quit()
             return
-        print("answerer: serializing audio/video session-accept Jingle")
-        remote = jingle_round_trip("session-accept", description)
+        print(f"{label}/answerer: serializing session-accept Jingle")
+        remote = round_trip("session-accept", description)
         peers["offerer"].set_remote_answer(remote)
 
-    def offerer_candidate(mid: str, candidate: str) -> None:
-        deliver_candidate("offerer", "answerer", mid, candidate)
-
-    def answerer_candidate(mid: str, candidate: str) -> None:
-        deliver_candidate("answerer", "offerer", mid, candidate)
-
-    # Video=True exercises multiple media sections. More importantly, the
-    # offerer is deliberately prevented from sending session-initiate until at
-    # least one transport-info candidate has already passed through the same
-    # SID-scoped buffer used by the runtime incoming controller.
     peers["offerer"] = WebRTCMediaEngine(
-        video=True,
+        video=video,
         on_local_description=offerer_description_ready,
-        on_ice_candidate=offerer_candidate,
+        on_ice_candidate=lambda mid, candidate: deliver_candidate(
+            "offerer", "answerer", mid, candidate
+        ),
         on_connected=lambda: ready("offerer"),
         on_failed=lambda reason: failed("offerer", reason),
         on_state=lambda value: state("offerer", value),
         test_mode=True,
     )
     peers["answerer"] = WebRTCMediaEngine(
-        video=True,
+        video=video,
         on_local_description=answerer_description_ready,
-        on_ice_candidate=answerer_candidate,
+        on_ice_candidate=lambda mid, candidate: deliver_candidate(
+            "answerer", "offerer", mid, candidate
+        ),
         on_connected=lambda: ready("answerer"),
         on_failed=lambda reason: failed("answerer", reason),
         on_state=lambda value: state("answerer", value),
@@ -219,38 +220,53 @@ def main() -> int:
     )
 
     def timeout() -> bool:
-        failures.append("Timed out waiting for Jingle ICE/DTLS connection")
+        failures.append(f"{label}: timed out waiting for Jingle ICE/DTLS connection")
         loop.quit()
         return GLib.SOURCE_REMOVE
 
     timeout_id = GLib.timeout_add_seconds(25, timeout)
-
     try:
         peers["offerer"].start_offer()
         loop.run()
     finally:
-        if timeout_id:
-            GLib.source_remove(timeout_id)
+        GLib.source_remove(timeout_id)
         for peer in peers.values():
             peer.close()
 
+    if connected != {"offerer", "answerer"} and not failures:
+        failures.append(f"{label}: only connected {sorted(connected)}")
+
     if failures:
-        print("\nJingle WebRTC loopback FAILED", file=sys.stderr)
-        for failure in failures:
-            print(f"  {failure}", file=sys.stderr)
-        print("\nState history:", file=sys.stderr)
+        print(f"\n{label} state history:", file=sys.stderr)
         for item in states:
             print(f"  {item}", file=sys.stderr)
+    else:
+        print(
+            f"{label}: Jingle WebRTC loopback OK: session-initiate/session-accept, "
+            "pre-session trickle ICE, DTLS, and RTP connected"
+        )
+    return failures
+
+
+def main() -> int:
+    ok, reason = probe_runtime()
+    if not ok:
+        print(f"Runtime probe failed: {reason}", file=sys.stderr)
+        return 2
+
+    failures: list[str] = []
+    # Exercise the production audio-call shape first. The previous integration
+    # test used video=True exclusively, which masked audio-only signaling bugs.
+    failures.extend(run_case(video=False))
+    failures.extend(run_case(video=True))
+
+    if failures:
+        print("\nJingle WebRTC integration FAILED", file=sys.stderr)
+        for failure in failures:
+            print(f"  {failure}", file=sys.stderr)
         return 1
 
-    if connected != {"offerer", "answerer"}:
-        print(f"Only connected: {sorted(connected)}", file=sys.stderr)
-        return 1
-
-    print(
-        "Jingle WebRTC loopback OK: pre-session transport-info buffering, "
-        "audio/video session-initiate/session-accept, trickle ICE, DTLS, and RTP connected"
-    )
+    print("All Jingle WebRTC integration cases passed")
     return 0
 
 

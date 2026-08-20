@@ -5,7 +5,15 @@ from gajim_calls.protocol import (
     parse_jmi,
     xml_text,
 )
-from gajim_calls.sdp import Codec, Fingerprint, IceCandidate, MediaSection, SessionDescription
+from gajim_calls.sdp import (
+    Codec,
+    Fingerprint,
+    IceCandidate,
+    MediaSection,
+    SessionDescription,
+    build_sdp,
+    parse_sdp,
+)
 
 
 def description():
@@ -53,10 +61,50 @@ def test_jingle_round_trip():
     assert event.action == "session-initiate"
     assert event.sid == "1234"
     assert event.initiator == "a@example.test/desktop"
+    assert event.description.bundle == ("audio",)
     assert event.description.media[0].codecs[0].name == "OPUS"
     assert event.description.media[0].fingerprint is not None
     assert event.description.media[0].fingerprint.value == "AA:BB:CC"
     assert event.description.media[0].candidates[0].port == 50000
+
+
+def test_audio_only_bundle_survives_sdp_jingle_sdp_round_trip():
+    original_sdp = """v=0
+ o=- 1 1 IN IP4 0.0.0.0
+ s=-
+ t=0 0
+ a=group:BUNDLE audio
+ m=audio 9 UDP/TLS/RTP/SAVPF 111
+ c=IN IP4 0.0.0.0
+ a=mid:audio
+ a=sendrecv
+ a=rtcp-mux
+ a=ice-ufrag:abc
+ a=ice-pwd:abcdefghijklmnopqrstuv
+ a=fingerprint:sha-256 AA:BB:CC
+ a=setup:actpass
+ a=rtpmap:111 OPUS/48000/2
+ """.replace("\n ", "\n")
+    local = parse_sdp(original_sdp)
+    assert local.bundle == ("audio",)
+
+    event = parse_jingle(
+        xml_text(
+            build_jingle(
+                "session-initiate",
+                "audio-only",
+                initiator="desktop@example.test/Gajim",
+                responder="phone@example.test/Conversations",
+                description=local,
+            )
+        )
+    )
+    assert event is not None
+    assert event.description.bundle == ("audio",)
+
+    rebuilt = build_sdp(event.description)
+    assert "a=group:BUNDLE audio\r\n" in rebuilt
+    assert parse_sdp(rebuilt).bundle == ("audio",)
 
 
 def test_transport_info_has_no_rtp_description():

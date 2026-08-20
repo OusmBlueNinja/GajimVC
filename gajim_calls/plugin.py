@@ -15,6 +15,7 @@ from gajim.plugins import GajimPlugin
 
 from . import controller as controller_module
 from . import module
+from .alerts import IncomingCallAlerts
 from .controller_runtime import RuntimeCallController
 from .gtk.config import ConfigDialog
 from .media_engine import WebRTCMediaEngine, probe_runtime
@@ -27,11 +28,15 @@ class GajimCallsPlugin(GajimPlugin):
         self.config_default_values = {
             "stun_server": ("", "GStreamer STUN URI"),
             "turn_server": ("", "GStreamer TURN URI"),
+            "incoming_notifications": (True, "Show an incoming-call notification"),
+            "incoming_ringtone": (True, "Play a ringtone for incoming calls"),
+            "ringtone_path": ("", "Custom incoming-call ringtone path"),
         }
         self.description = "Audio calls using XMPP Jingle and GStreamer WebRTC"
         self.config_dialog = partial(ConfigDialog, self)
 
         controller_module.WebRTCMediaEngine = WebRTCMediaEngine
+        self.incoming_alerts = IncomingCallAlerts(self)
         self.controller = RuntimeCallController(self)
         module.set_controller(self.controller)
         self.modules = [module]
@@ -46,6 +51,8 @@ class GajimCallsPlugin(GajimPlugin):
         ] | None = None
         self._toolbar_retry_id: int | None = None
         self._toolbar_retry_attempts = 0
+        self._startup_retry_id: int | None = None
+        self._startup_retry_attempts = 0
         self._call_active = False
         self._call_connected = False
         self._css_provider: Gtk.CssProvider | None = None
@@ -71,11 +78,25 @@ class GajimCallsPlugin(GajimPlugin):
 
     def activate(self) -> None:
         log.info("Gajim Calls activated")
+        # Extension points are normally called when a chat is created, but a
+        # plugin can also be loaded after Gajim has already restored a chat.
+        # Discover that existing MessageActionsBox during startup as well.
+        self._schedule_startup_registration()
 
     def deactivate(self) -> None:
+        self.incoming_alerts.stop()
         self.controller.shutdown()
+        self._cancel_startup_retry()
         self._remove_toolbar_control()
         module.set_controller(None)
+
+    def incoming_call_started(
+        self, account: str, sid: str, peer: str, *, video: bool
+    ) -> None:
+        self.incoming_alerts.start(account, sid, peer, video=video)
+
+    def incoming_call_stopped(self, sid: str | None = None) -> None:
+        self.incoming_alerts.stop(sid)
 
     @staticmethod
     def _walk_widgets(root: Gtk.Widget | None):
@@ -91,6 +112,23 @@ class GajimCallsPlugin(GajimPlugin):
                 children.append(child)
                 child = child.get_next_sibling()
             stack.extend(reversed(children))
+
+    def _find_current_message_actions_box(self) -> MessageActionsBox | None:
+        try:
+            root = app.window
+        except Exception:
+            return None
+        fallback = None
+        for widget in self._walk_widgets(root):
+            if not isinstance(widget, MessageActionsBox):
+                continue
+            fallback = fallback or widget
+            try:
+                if widget.get_visible() and widget.get_mapped():
+                    return widget
+            except Exception:
+                return widget
+        return fallback
 
     def _find_chat_toolbar_target(self) -> tuple[Gtk.Widget | None, Gtk.Widget | None]:
         """Find the conversation toolbar containing Search and Chat Details."""
@@ -134,6 +172,51 @@ class GajimCallsPlugin(GajimPlugin):
         except (AttributeError, TypeError):
             pass
 
+    @staticmethod
+    def _supports_calls(message_actions_box: MessageActionsBox) -> bool:
+        try:
+            return isinstance(message_actions_box.get_current_contact(), BareContact)
+        except Exception:
+            return False
+
+    def _cancel_startup_retry(self) -> None:
+        if self._startup_retry_id is None:
+            return
+        try:
+            GLib.source_remove(self._startup_retry_id)
+        except Exception:
+            pass
+        self._startup_retry_id = None
+        self._startup_retry_attempts = 0
+
+    def _ensure_toolbar_registered(self) -> bool:
+        if self._toolbar_entry is not None:
+            self._startup_retry_id = None
+            self._startup_retry_attempts = 0
+            self._schedule_toolbar_attach()
+            return False
+
+        message_actions_box = self._find_current_message_actions_box()
+        if message_actions_box is not None:
+            self._startup_retry_id = None
+            self._startup_retry_attempts = 0
+            self._message_actions_box_created(message_actions_box, message_actions_box)
+            return False
+
+        self._startup_retry_attempts += 1
+        if self._startup_retry_attempts >= 40:
+            self._startup_retry_id = None
+            log.debug("No restored MessageActionsBox found during startup retries")
+            return False
+        return True
+
+    def _schedule_startup_registration(self) -> None:
+        self._cancel_startup_retry()
+        if self._ensure_toolbar_registered():
+            self._startup_retry_id = GLib.timeout_add(
+                250, self._ensure_toolbar_registered
+            )
+
     def _cancel_toolbar_retry(self) -> None:
         if self._toolbar_retry_id is None:
             return
@@ -152,6 +235,7 @@ class GajimCallsPlugin(GajimPlugin):
             return False
 
         message_actions_box, _container, button = entry
+        button.set_visible(self._supports_calls(message_actions_box))
         toolbar, search_button = self._find_chat_toolbar_target()
         if toolbar is not None and search_button is not None and hasattr(
             toolbar, "insert_child_after"
@@ -214,8 +298,6 @@ class GajimCallsPlugin(GajimPlugin):
             )
             image.remove_css_class("gajim-calls-mirrored-phone")
             if not active:
-                # The theme's phone handset points the opposite way from the
-                # requested UI, so mirror only the start-call icon.
                 image.add_css_class("gajim-calls-mirrored-phone")
 
         if not active:
@@ -231,12 +313,16 @@ class GajimCallsPlugin(GajimPlugin):
         button.set_sensitive(True)
 
     def _message_actions_box_created(
-        self, message_actions_box: MessageActionsBox, action_box: Gtk.Box
+        self, message_actions_box: MessageActionsBox, action_box: Gtk.Widget
     ) -> None:
-        # A new active conversation can replace the old MessageActionsBox. Move
-        # the single call control to the current conversation instead of keeping
-        # a stale button bound to the prior chat.
-        if self._toolbar_entry is not None:
+        self._cancel_startup_retry()
+        entry = self._toolbar_entry
+        if entry is not None and entry[0] is message_actions_box:
+            entry[2].set_visible(self._supports_calls(message_actions_box))
+            self._schedule_toolbar_attach()
+            return
+
+        if entry is not None:
             self._remove_toolbar_control()
 
         image = Gtk.Image.new_from_icon_name("call-start-symbolic")
@@ -245,6 +331,7 @@ class GajimCallsPlugin(GajimPlugin):
         call_button.set_child(image)
         call_button.set_tooltip_text("Start audio call")
         call_button.add_css_class("flat")
+        call_button.set_visible(self._supports_calls(message_actions_box))
         call_button.connect(
             "clicked",
             lambda _button: self._on_call_button_clicked(message_actions_box),
@@ -255,12 +342,15 @@ class GajimCallsPlugin(GajimPlugin):
         self._schedule_toolbar_attach()
 
     def _message_actions_box_destroyed(
-        self, message_actions_box: MessageActionsBox, _action_box: Gtk.Box
+        self, message_actions_box: MessageActionsBox, _action_box: Gtk.Widget
     ) -> None:
         entry = self._toolbar_entry
         if entry is None or entry[0] is not message_actions_box:
             return
         self._remove_toolbar_control()
+        # If Gajim is swapping restored/current chats, discover the replacement
+        # even if its extension callback raced with the destruction callback.
+        self._schedule_startup_registration()
 
     def _on_call_button_clicked(self, message_actions_box: MessageActionsBox) -> None:
         if self._call_active:
@@ -282,7 +372,5 @@ class GajimCallsPlugin(GajimPlugin):
             )
             return
 
-        # Video calling remains implemented internally, but the video button is
-        # intentionally hidden until the planned video-call feature is ready.
         self.set_call_active(True, connected=False)
         self.controller.start_outgoing(contact.account, contact.jid, video=False)

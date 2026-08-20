@@ -2,18 +2,21 @@
 
 from __future__ import annotations
 
-from gi.repository import Gtk
+from pathlib import Path
+
+from gi.repository import Gio, Gtk
 
 
 class ConfigDialog(Gtk.Window):
     def __init__(self, plugin, transient) -> None:
         super().__init__(title="Gajim Calls")
         self._plugin = plugin
+        self._ringtone_chooser = None
         self.set_transient_for(transient)
         self.set_modal(True)
-        self.set_default_size(520, 260)
+        self.set_default_size(620, 430)
 
-        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
         root.set_margin_top(18)
         root.set_margin_bottom(18)
         root.set_margin_start(18)
@@ -22,8 +25,8 @@ class ConfigDialog(Gtk.Window):
 
         intro = Gtk.Label(
             label=(
-                "STUN is optional on simple networks. TURN is strongly recommended "
-                "for reliable calls across restrictive NAT/firewalls."
+                "Configure network traversal and how Gajim Calls alerts you about "
+                "incoming calls."
             ),
             wrap=True,
             xalign=0,
@@ -38,7 +41,7 @@ class ConfigDialog(Gtk.Window):
         self._stun.set_placeholder_text("stun://stun.example.org:3478")
         self._stun.set_text(str(plugin.config["stun_server"] or ""))
         self._stun.set_hexpand(True)
-        grid.attach(self._stun, 1, 0, 1, 1)
+        grid.attach(self._stun, 1, 0, 2, 1)
 
         grid.attach(Gtk.Label(label="TURN server", xalign=0), 0, 1, 1, 1)
         self._turn = Gtk.Entry()
@@ -47,24 +50,59 @@ class ConfigDialog(Gtk.Window):
         )
         self._turn.set_text(str(plugin.config["turn_server"] or ""))
         self._turn.set_hexpand(True)
-        grid.attach(self._turn, 1, 1, 1, 1)
+        grid.attach(self._turn, 1, 1, 2, 1)
 
-        note = Gtk.Label(
+        separator = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        root.append(separator)
+
+        alert_title = Gtk.Label(label="Incoming calls", xalign=0)
+        alert_title.add_css_class("heading")
+        root.append(alert_title)
+
+        alerts = Gtk.Grid(column_spacing=12, row_spacing=12)
+        root.append(alerts)
+
+        alerts.attach(Gtk.Label(label="Desktop notification", xalign=0), 0, 0, 1, 1)
+        self._notifications = Gtk.Switch()
+        self._notifications.set_halign(Gtk.Align.START)
+        self._notifications.set_active(bool(plugin.config["incoming_notifications"]))
+        alerts.attach(self._notifications, 1, 0, 1, 1)
+
+        alerts.attach(Gtk.Label(label="Play ringtone", xalign=0), 0, 1, 1, 1)
+        self._ringtone_enabled = Gtk.Switch()
+        self._ringtone_enabled.set_halign(Gtk.Align.START)
+        self._ringtone_enabled.set_active(bool(plugin.config["incoming_ringtone"]))
+        alerts.attach(self._ringtone_enabled, 1, 1, 1, 1)
+
+        alerts.attach(Gtk.Label(label="Custom ringtone", xalign=0), 0, 2, 1, 1)
+        self._ringtone_path = Gtk.Entry()
+        self._ringtone_path.set_hexpand(True)
+        self._ringtone_path.set_placeholder_text("Use bundled default ringtone")
+        self._ringtone_path.set_text(str(plugin.config["ringtone_path"] or ""))
+        alerts.attach(self._ringtone_path, 1, 2, 1, 1)
+
+        browse = Gtk.Button(label="Browse…")
+        browse.connect("clicked", self._choose_ringtone)
+        alerts.attach(browse, 2, 2, 1, 1)
+
+        hint = Gtk.Label(
             label=(
-                "TURN credentials are stored in Gajim's plugin configuration. "
-                "Use short-lived credentials when your TURN service supports them."
+                "Leave the custom ringtone empty to use the bundled default. "
+                "Notification and ringtone options are independent."
             ),
             wrap=True,
             xalign=0,
         )
-        note.add_css_class("dim-label")
-        root.append(note)
+        hint.add_css_class("dim-label")
+        root.append(hint)
 
         buttons = Gtk.Box(
             orientation=Gtk.Orientation.HORIZONTAL,
             spacing=8,
             halign=Gtk.Align.END,
         )
+        buttons.set_vexpand(True)
+        buttons.set_valign(Gtk.Align.END)
         root.append(buttons)
         cancel = Gtk.Button(label="Cancel")
         cancel.connect("clicked", lambda _b: self.close())
@@ -77,7 +115,42 @@ class ConfigDialog(Gtk.Window):
 
         self.present()
 
+    def _choose_ringtone(self, _button) -> None:
+        chooser = Gtk.FileChooserNative.new(
+            "Choose ringtone",
+            self,
+            Gtk.FileChooserAction.OPEN,
+            "Select",
+            "Cancel",
+        )
+        current = self._ringtone_path.get_text().strip()
+        if current and Path(current).is_file():
+            try:
+                chooser.set_file(Gio.File.new_for_path(current))
+            except Exception:
+                pass
+        audio_filter = Gtk.FileFilter()
+        audio_filter.set_name("Audio files")
+        audio_filter.add_mime_type("audio/*")
+        chooser.add_filter(audio_filter)
+        chooser.connect("response", self._ringtone_chosen)
+        self._ringtone_chooser = chooser
+        chooser.show()
+
+    def _ringtone_chosen(self, chooser, response) -> None:
+        if response == Gtk.ResponseType.ACCEPT:
+            selected = chooser.get_file()
+            if selected is not None:
+                path = selected.get_path()
+                if path:
+                    self._ringtone_path.set_text(path)
+        chooser.hide()
+        self._ringtone_chooser = None
+
     def _save(self, _button) -> None:
         self._plugin.config["stun_server"] = self._stun.get_text().strip()
         self._plugin.config["turn_server"] = self._turn.get_text().strip()
+        self._plugin.config["incoming_notifications"] = self._notifications.get_active()
+        self._plugin.config["incoming_ringtone"] = self._ringtone_enabled.get_active()
+        self._plugin.config["ringtone_path"] = self._ringtone_path.get_text().strip()
         self.close()

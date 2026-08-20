@@ -6,7 +6,7 @@ import logging
 
 from .controller import CallController
 from .incoming import RemoteCandidateBuffer
-from .protocol import JingleEvent
+from .protocol import JMIEvent, JingleEvent
 from .sdp import SessionDescription
 from .state import CallState
 
@@ -16,11 +16,41 @@ _TERMINAL_STATES = {CallState.ENDED, CallState.FAILED}
 
 
 class RuntimeCallController(CallController):
-    """CallController with correct incoming trickle-ICE behaviour."""
+    """CallController with runtime UI, alert, and trickle-ICE behaviour."""
 
     def __init__(self, plugin) -> None:
         super().__init__(plugin)
         self._early_remote_candidates = RemoteCandidateBuffer()
+
+    def _start_incoming_alerts(self) -> None:
+        context = self.context
+        if (
+            context is None
+            or not context.incoming
+            or context.state != CallState.RINGING
+        ):
+            return
+        callback = getattr(self.plugin, "incoming_call_started", None)
+        if callable(callback):
+            callback(
+                context.account,
+                context.sid,
+                context.peer_bare,
+                video=context.has_video,
+            )
+
+    def _stop_incoming_alerts(self, sid: str | None = None) -> None:
+        callback = getattr(self.plugin, "incoming_call_stopped", None)
+        if callable(callback):
+            callback(sid)
+
+    def handle_jmi(self, account: str, from_jid: str, event: JMIEvent) -> bool:
+        handled = super().handle_jmi(account, from_jid, event)
+        if handled and event.action == "propose":
+            context = self.context
+            if context is not None and context.sid == event.id:
+                self._start_incoming_alerts()
+        return handled
 
     def handle_jingle(self, account: str, from_jid: str, event: JingleEvent) -> None:
         # Conversations can trickle ICE while the incoming call is still
@@ -37,6 +67,22 @@ class RuntimeCallController(CallController):
             return
 
         super().handle_jingle(account, from_jid, event)
+        if event.action == "session-initiate":
+            context = self.context
+            if context is not None and context.sid == event.sid:
+                self._start_incoming_alerts()
+
+    def accept(self) -> None:
+        context = self.context
+        if context is not None:
+            self._stop_incoming_alerts(context.sid)
+        super().accept()
+
+    def decline(self) -> None:
+        context = self.context
+        if context is not None:
+            self._stop_incoming_alerts(context.sid)
+        super().decline()
 
     def _start_media(self, *, offerer: bool, remote_offer=None) -> None:
         context = self.context
@@ -87,12 +133,7 @@ class RuntimeCallController(CallController):
         return "general-error"
 
     def _terminate_remote_failure(self, reason: str) -> None:
-        """Tell the peer that a locally failed negotiation is over.
-
-        Without this, Conversations remains in its Connecting state until its
-        own timeout because the local media engine disappears without a final
-        Jingle/JMI termination signal.
-        """
+        """Tell the peer that a locally failed negotiation is over."""
         context = self.context
         if context is None:
             return
@@ -121,8 +162,6 @@ class RuntimeCallController(CallController):
                     wire_reason,
                 )
 
-            # JMI finish is useful even after Jingle has started: Conversations
-            # uses it to clear the higher-level call proposal state promptly.
             module.send_jmi(peer, "finish", context.sid, reason=wire_reason)
             log.info(
                 "TX failure JMI finish sid=%s to=%s reason=%s",
@@ -131,8 +170,6 @@ class RuntimeCallController(CallController):
                 wire_reason,
             )
         except Exception:
-            # A signaling failure must never prevent local media cleanup or the
-            # user-facing failure dialog from being shown.
             log.exception(
                 "Unable to signal remote call failure sid=%s peer=%s reason=%s",
                 context.sid,
@@ -143,24 +180,24 @@ class RuntimeCallController(CallController):
     def hangup(self) -> None:
         """Cancel ringing/connecting calls immediately; hang up connected calls."""
         context = self.context
+        if context is not None:
+            self._stop_incoming_alerts(context.sid)
         if context is None or context.state in _TERMINAL_STATES:
             super().hangup()
             self.plugin.set_call_active(False)
             return
 
-        # The base controller already has the correct XEP-0353 retract/reject
-        # behaviour while a proposal is merely ringing.
         if context.state in {CallState.PROPOSING, CallState.RINGING}:
-            log.info("Cancelling ringing call sid=%s peer=%s", context.sid, context.peer_bare)
+            log.info(
+                "Cancelling ringing call sid=%s peer=%s",
+                context.sid,
+                context.peer_bare,
+            )
             self.plugin.set_call_active(False)
             super().hangup()
             return
 
         if context.state == CallState.NEGOTIATING:
-            # At this point either side may already have begun Jingle while the
-            # media worker is still negotiating. Send both layers so a peer such
-            # as Conversations leaves Connecting immediately regardless of the
-            # exact JMI/Jingle race we are in.
             peer = context.peer_full or context.peer_bare
             module = self._module(context.account)
             try:
@@ -193,7 +230,6 @@ class RuntimeCallController(CallController):
             self._finish_local(CallState.ENDED)
             return
 
-        # Connected calls use the normal success termination path.
         self.plugin.set_call_active(False)
         super().hangup()
 
@@ -209,9 +245,17 @@ class RuntimeCallController(CallController):
         self._finish_local(CallState.FAILED, hide=False)
 
     def _finish_local(self, state: CallState, *, hide: bool = True) -> None:
+        context = self.context
+        if context is not None:
+            self._stop_incoming_alerts(context.sid)
         self._early_remote_candidates.clear()
         super()._finish_local(state, hide=hide)
 
     def _cleanup(self, terminal: bool = True) -> None:
+        context = self.context
+        if context is not None:
+            self._stop_incoming_alerts(context.sid)
+        else:
+            self._stop_incoming_alerts()
         self._early_remote_candidates.clear()
         super()._cleanup(terminal=terminal)

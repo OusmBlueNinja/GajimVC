@@ -13,6 +13,7 @@ from nbxmpp.structs import StanzaHandler
 from gajim.common.modules.base import BaseModule
 
 from .constants import NS_JINGLE, NS_JMI
+from .incoming import is_ice_transport_info
 from .protocol import (
     build_jingle,
     build_jmi,
@@ -112,7 +113,11 @@ class CallsModule(BaseModule):
                 for section in event.description.media
             )
         )
-        if not owned and not rtp_offer:
+        # A peer can trickle ICE before the controller has claimed the SID.
+        # Preserve only transport-info that actually contains ICE-UDP
+        # candidates; leave unrelated Jingle traffic to Gajim's own modules.
+        early_ice = is_ice_transport_info(event)
+        if not owned and not rtp_offer and not early_ice:
             # Leave non-call Jingle (for example file transfers) to Gajim.
             return
 

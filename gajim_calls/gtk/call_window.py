@@ -82,6 +82,13 @@ class CallWindow(Gtk.Window):
 
     def set_status(self, text: str) -> None:
         self._status.set_text(text)
+        # Once the user accepts an incoming call, switch immediately to the
+        # in-call controls instead of leaving Accept/Decline visible while the
+        # Jingle/ICE negotiation is running.
+        if text.startswith("Connecting"):
+            self._accept.set_visible(False)
+            self._decline.set_visible(False)
+            self._hangup.set_visible(True)
 
     def connected(self, video: bool) -> None:
         self._status.set_text("Connected")

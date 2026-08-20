@@ -4,23 +4,165 @@ from __future__ import annotations
 
 import logging
 
+from gi.repository import GLib
+
 from .controller import CallController
 from .incoming import RemoteCandidateBuffer
 from .protocol import JMIEvent, JingleEvent
 from .sdp import SessionDescription
 from .state import CallState
+from .timeout_policy import TimeoutPhase, plan_timeout
 
 log = logging.getLogger("gajim.p.gajim_calls.controller")
 
 _TERMINAL_STATES = {CallState.ENDED, CallState.FAILED}
+_RINGING_TIMEOUT_SECONDS = 60
+_NEGOTIATION_TIMEOUT_SECONDS = 35
 
 
 class RuntimeCallController(CallController):
-    """CallController with runtime UI, alert, and trickle-ICE behaviour."""
+    """CallController with runtime UI, alert, trickle-ICE, and timeout behaviour."""
 
     def __init__(self, plugin) -> None:
         super().__init__(plugin)
         self._early_remote_candidates = RemoteCandidateBuffer()
+        self._phase_timeout_id: int | None = None
+        self._phase_timeout_sid: str | None = None
+        self._phase_timeout_phase: TimeoutPhase | None = None
+
+    @staticmethod
+    def _uses_jmi(context) -> bool:
+        return context.metadata.get("signaling") == "jmi"
+
+    def _cancel_phase_timeout(self) -> None:
+        source_id = self._phase_timeout_id
+        self._phase_timeout_id = None
+        self._phase_timeout_sid = None
+        self._phase_timeout_phase = None
+        if source_id is None:
+            return
+        try:
+            GLib.source_remove(source_id)
+        except Exception:
+            log.debug("Unable to remove call phase timeout", exc_info=True)
+
+    def _arm_phase_timeout(self, phase: TimeoutPhase) -> None:
+        context = self.context
+        if context is None or context.state in _TERMINAL_STATES:
+            self._cancel_phase_timeout()
+            return
+
+        seconds = (
+            _RINGING_TIMEOUT_SECONDS
+            if phase == "ringing"
+            else _NEGOTIATION_TIMEOUT_SECONDS
+        )
+        self._cancel_phase_timeout()
+        sid = context.sid
+        self._phase_timeout_sid = sid
+        self._phase_timeout_phase = phase
+        self._phase_timeout_id = GLib.timeout_add_seconds(
+            seconds, self._on_phase_timeout, sid, phase
+        )
+        log.debug("Armed %s timeout for sid=%s in %ss", phase, sid, seconds)
+
+    def _jingle_started(self, context) -> bool:
+        if context.incoming:
+            return self._pending_offer is not None
+        return self._local_description is not None
+
+    def _on_phase_timeout(self, sid: str, phase: TimeoutPhase) -> bool:
+        # Clear the active source before cleanup; _finish_local() can safely call
+        # _cancel_phase_timeout() without trying to remove the callback in flight.
+        if self._phase_timeout_sid == sid and self._phase_timeout_phase == phase:
+            self._phase_timeout_id = None
+            self._phase_timeout_sid = None
+            self._phase_timeout_phase = None
+
+        context = self.context
+        if context is None or context.sid != sid or context.state in _TERMINAL_STATES:
+            return GLib.SOURCE_REMOVE
+
+        if phase == "ringing":
+            if context.state not in {CallState.PROPOSING, CallState.RINGING}:
+                return GLib.SOURCE_REMOVE
+        elif phase == "negotiating":
+            if context.state != CallState.NEGOTIATING:
+                return GLib.SOURCE_REMOVE
+        else:
+            return GLib.SOURCE_REMOVE
+
+        uses_jmi = self._uses_jmi(context)
+        plan = plan_timeout(
+            phase,
+            incoming=context.incoming,
+            uses_jmi=uses_jmi,
+            jingle_started=self._jingle_started(context),
+        )
+        module = self._module(context.account)
+        peer = context.peer_full or context.peer_bare
+
+        try:
+            if plan.terminate_jingle and context.peer_full is not None:
+                module.send_jingle(
+                    context.peer_full,
+                    "session-terminate",
+                    context.sid,
+                    initiator=context.initiator or self._own_jid(context.account),
+                    responder=context.responder,
+                    reason=plan.jingle_reason,
+                )
+                log.info(
+                    "TX timeout session-terminate sid=%s to=%s",
+                    context.sid,
+                    context.peer_full,
+                )
+
+            if plan.jmi_action is not None:
+                target = (
+                    context.peer_bare
+                    if plan.jmi_action == "retract"
+                    else peer
+                )
+                module.send_jmi(
+                    target,
+                    plan.jmi_action,
+                    context.sid,
+                    reason=plan.jmi_reason,
+                )
+                log.info(
+                    "TX timeout JMI %s sid=%s to=%s",
+                    plan.jmi_action,
+                    context.sid,
+                    target,
+                )
+        except Exception:
+            log.exception(
+                "Unable to signal %s timeout sid=%s peer=%s",
+                phase,
+                context.sid,
+                peer,
+            )
+
+        self._stop_incoming_alerts(context.sid)
+        self._get_window().set_status("Call timed out")
+        callback = getattr(self.plugin, "set_call_active", None)
+        if callable(callback):
+            callback(False)
+        self._finish_local(CallState.ENDED)
+        return GLib.SOURCE_REMOVE
+
+    def start_outgoing(self, account: str, peer_jid, *, video: bool) -> None:
+        previous_sid = self.context.sid if self.context is not None else None
+        super().start_outgoing(account, peer_jid, video=video)
+        context = self.context
+        if (
+            context is not None
+            and context.sid != previous_sid
+            and context.state == CallState.PROPOSING
+        ):
+            context.metadata["signaling"] = "jmi"
+            self._arm_phase_timeout("ringing")
 
     def _start_incoming_alerts(self) -> None:
         context = self.context
@@ -46,17 +188,18 @@ class RuntimeCallController(CallController):
 
     def handle_jmi(self, account: str, from_jid: str, event: JMIEvent) -> bool:
         handled = super().handle_jmi(account, from_jid, event)
+        context = self.context
         if handled and event.action == "propose":
-            context = self.context
-            if context is not None and context.sid == event.id:
+            if context is not None and context.sid == event.id and context.incoming:
+                context.metadata["signaling"] = "jmi"
                 self._start_incoming_alerts()
+                self._arm_phase_timeout("ringing")
+        elif handled and event.action == "proceed":
+            if context is not None and context.sid == event.id:
+                self._arm_phase_timeout("negotiating")
         return handled
 
     def handle_jingle(self, account: str, from_jid: str, event: JingleEvent) -> None:
-        # Conversations can trickle ICE while a JMI call is still ringing. The
-        # JMI proposal has already created the call context, so buffer only the
-        # exact account/SID we own. Never let an unrelated Jingle session feed
-        # candidates into the active call.
         if event.action == "transport-info" and self.media is None:
             context = self.context
             if (
@@ -81,16 +224,26 @@ class RuntimeCallController(CallController):
             return
 
         super().handle_jingle(account, from_jid, event)
+        context = self.context
         if event.action == "session-initiate":
-            context = self.context
             if context is not None and context.sid == event.sid:
                 self._start_incoming_alerts()
+                if context.state == CallState.RINGING:
+                    # Direct Jingle arrived without JMI and is waiting for user.
+                    self._arm_phase_timeout("ringing")
+                elif context.state == CallState.NEGOTIATING:
+                    # JMI proceed already happened; give WebRTC a fresh bounded
+                    # negotiation window once the actual offer arrives.
+                    self._arm_phase_timeout("negotiating")
 
     def accept(self) -> None:
         context = self.context
         if context is not None:
             self._stop_incoming_alerts(context.sid)
         super().accept()
+        context = self.context
+        if context is not None and context.state == CallState.NEGOTIATING:
+            self._arm_phase_timeout("negotiating")
 
     def decline(self) -> None:
         context = self.context
@@ -134,6 +287,7 @@ class RuntimeCallController(CallController):
         if context is None or context.state in _TERMINAL_STATES:
             log.debug("Ignoring late media-connected callback for cancelled/ended call")
             return
+        self._cancel_phase_timeout()
         super()._on_media_connected()
 
     @staticmethod
@@ -145,7 +299,6 @@ class RuntimeCallController(CallController):
         return "general-error"
 
     def _terminate_remote_failure(self, reason: str) -> None:
-        """Tell the peer that a locally failed negotiation is over."""
         context = self.context
         if context is None:
             return
@@ -174,13 +327,14 @@ class RuntimeCallController(CallController):
                     wire_reason,
                 )
 
-            module.send_jmi(peer, "finish", context.sid, reason=wire_reason)
-            log.info(
-                "TX failure JMI finish sid=%s to=%s reason=%s",
-                context.sid,
-                peer,
-                wire_reason,
-            )
+            if self._uses_jmi(context):
+                module.send_jmi(peer, "finish", context.sid, reason=wire_reason)
+                log.info(
+                    "TX failure JMI finish sid=%s to=%s reason=%s",
+                    context.sid,
+                    peer,
+                    wire_reason,
+                )
         except Exception:
             log.exception(
                 "Unable to signal remote call failure sid=%s peer=%s reason=%s",
@@ -190,13 +344,14 @@ class RuntimeCallController(CallController):
             )
 
     def hangup(self) -> None:
-        """Cancel ringing/connecting calls immediately; hang up connected calls."""
         context = self.context
         if context is not None:
             self._stop_incoming_alerts(context.sid)
         if context is None or context.state in _TERMINAL_STATES:
             super().hangup()
-            self.plugin.set_call_active(False)
+            callback = getattr(self.plugin, "set_call_active", None)
+            if callable(callback):
+                callback(False)
             return
 
         if context.state in {CallState.PROPOSING, CallState.RINGING}:
@@ -205,7 +360,9 @@ class RuntimeCallController(CallController):
                 context.sid,
                 context.peer_bare,
             )
-            self.plugin.set_call_active(False)
+            callback = getattr(self.plugin, "set_call_active", None)
+            if callable(callback):
+                callback(False)
             super().hangup()
             return
 
@@ -213,7 +370,7 @@ class RuntimeCallController(CallController):
             peer = context.peer_full or context.peer_bare
             module = self._module(context.account)
             try:
-                if context.peer_full is not None:
+                if context.peer_full is not None and self._jingle_started(context):
                     module.send_jingle(
                         context.peer_full,
                         "session-terminate",
@@ -227,8 +384,9 @@ class RuntimeCallController(CallController):
                         context.sid,
                         context.peer_full,
                     )
-                module.send_jmi(peer, "finish", context.sid, reason="cancel")
-                log.info("TX cancel JMI finish sid=%s to=%s", context.sid, peer)
+                if self._uses_jmi(context):
+                    module.send_jmi(peer, "finish", context.sid, reason="cancel")
+                    log.info("TX cancel JMI finish sid=%s to=%s", context.sid, peer)
             except Exception:
                 log.exception(
                     "Unable to signal call cancellation sid=%s peer=%s",
@@ -236,11 +394,15 @@ class RuntimeCallController(CallController):
                     peer,
                 )
 
-            self.plugin.set_call_active(False)
+            callback = getattr(self.plugin, "set_call_active", None)
+            if callable(callback):
+                callback(False)
             self._finish_local(CallState.ENDED)
             return
 
-        self.plugin.set_call_active(False)
+        callback = getattr(self.plugin, "set_call_active", None)
+        if callable(callback):
+            callback(False)
         super().hangup()
 
     def _on_media_failed(self, reason: str) -> None:
@@ -255,6 +417,7 @@ class RuntimeCallController(CallController):
         self._finish_local(CallState.FAILED, hide=False)
 
     def _finish_local(self, state: CallState, *, hide: bool = True) -> None:
+        self._cancel_phase_timeout()
         context = self.context
         if context is not None:
             self._stop_incoming_alerts(context.sid)
@@ -262,6 +425,7 @@ class RuntimeCallController(CallController):
         super()._finish_local(state, hide=hide)
 
     def _cleanup(self, terminal: bool = True) -> None:
+        self._cancel_phase_timeout()
         context = self.context
         if context is not None:
             self._stop_incoming_alerts(context.sid)

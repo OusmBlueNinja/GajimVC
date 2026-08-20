@@ -13,8 +13,8 @@
     "win32"
   ],
   "requirements": [
-    "gajim>=2.4.2,<2.5.0"
+    "gajim>=2.4.2,<2.6.0"
   ],
   "short_name": "gajim_calls",
-  "version": "0.1.0"
+  "version": "0.1.1"
 }

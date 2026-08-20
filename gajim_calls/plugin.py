@@ -13,7 +13,7 @@ from gajim.gtk.message_actions_box import MessageActionsBox
 from gajim.plugins import GajimPlugin
 
 from . import controller as controller_module
-from .controller import CallController
+from .controller_runtime import RuntimeCallController
 from .gtk.config import ConfigDialog
 from .media_engine import WebRTCMediaEngine, probe_runtime
 from . import module
@@ -36,7 +36,7 @@ class GajimCallsPlugin(GajimPlugin):
         # its public surface stable while selecting the hardened implementation
         # that fixes current GStreamer promise/BUNDLE/ICE interoperability.
         controller_module.WebRTCMediaEngine = WebRTCMediaEngine
-        self.controller = CallController(self)
+        self.controller = RuntimeCallController(self)
         module.set_controller(self.controller)
         self.modules = [module]
         self.gui_extension_points = {

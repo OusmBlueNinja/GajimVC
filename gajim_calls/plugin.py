@@ -5,7 +5,7 @@ from __future__ import annotations
 from functools import partial
 import logging
 
-from gi.repository import Gtk
+from gi.repository import Gdk, GLib, Gtk
 
 from gajim.common import app
 from gajim.common.modules.contacts import BareContact
@@ -31,9 +31,6 @@ class GajimCallsPlugin(GajimPlugin):
         self.description = "Audio calls using XMPP Jingle and GStreamer WebRTC"
         self.config_dialog = partial(ConfigDialog, self)
 
-        # controller.py historically imported the media class directly. Keep
-        # its public surface stable while selecting the hardened implementation
-        # that fixes current GStreamer promise/BUNDLE/ICE interoperability.
         controller_module.WebRTCMediaEngine = WebRTCMediaEngine
         self.controller = RuntimeCallController(self)
         module.set_controller(self.controller)
@@ -47,12 +44,30 @@ class GajimCallsPlugin(GajimPlugin):
         self._toolbar_entry: tuple[
             MessageActionsBox, Gtk.Widget, Gtk.Button
         ] | None = None
+        self._toolbar_retry_id: int | None = None
+        self._toolbar_retry_attempts = 0
         self._call_active = False
+        self._call_connected = False
+        self._css_provider: Gtk.CssProvider | None = None
+        self._install_css()
 
         ok, reason = probe_runtime()
         if not ok:
             self.activatable = False
             self.available_text = reason
+
+    def _install_css(self) -> None:
+        display = Gdk.Display.get_default()
+        if display is None:
+            return
+        provider = Gtk.CssProvider()
+        provider.load_from_data(
+            b".gajim-calls-mirrored-phone { -gtk-icon-transform: scaleX(-1); }"
+        )
+        Gtk.StyleContext.add_provider_for_display(
+            display, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+        self._css_provider = provider
 
     def activate(self) -> None:
         log.info("Gajim Calls activated")
@@ -97,9 +112,6 @@ class GajimCallsPlugin(GajimPlugin):
             ):
                 details_button = widget
 
-        # Gajim 2.5 places Search and Chat Details and Settings in the same
-        # conversation toolbar. Insert immediately after Search so the call
-        # action sits with those chat actions rather than in the window caption.
         if search_button is not None:
             return search_button.get_parent(), search_button
         if details_button is not None:
@@ -122,7 +134,64 @@ class GajimCallsPlugin(GajimPlugin):
         except (AttributeError, TypeError):
             pass
 
+    def _cancel_toolbar_retry(self) -> None:
+        if self._toolbar_retry_id is None:
+            return
+        try:
+            GLib.source_remove(self._toolbar_retry_id)
+        except Exception:
+            pass
+        self._toolbar_retry_id = None
+        self._toolbar_retry_attempts = 0
+
+    def _attach_toolbar_control(self) -> bool:
+        """Attach beside the chat controls, retrying while Gajim builds its UI."""
+        entry = self._toolbar_entry
+        if entry is None:
+            self._toolbar_retry_id = None
+            return False
+
+        message_actions_box, _container, button = entry
+        toolbar, search_button = self._find_chat_toolbar_target()
+        if toolbar is not None and search_button is not None and hasattr(
+            toolbar, "insert_child_after"
+        ):
+            self._detach(button)
+            # GtkBox insert_child_after inserts after the supplied sibling. To
+            # put Call immediately LEFT of Search, insert after Search's prior
+            # sibling (or prepend when Search is the first item).
+            previous = search_button.get_prev_sibling()
+            if previous is None and hasattr(toolbar, "prepend"):
+                toolbar.prepend(button)
+            else:
+                toolbar.insert_child_after(button, previous)
+            self._toolbar_entry = (message_actions_box, toolbar, button)
+            self._toolbar_retry_id = None
+            self._toolbar_retry_attempts = 0
+            self.set_call_active(self._call_active, connected=self._call_connected)
+            log.info("Attached call button immediately left of Search")
+            return False
+
+        self._toolbar_retry_attempts += 1
+        if self._toolbar_retry_attempts >= 40:
+            log.error(
+                "Could not find chat toolbar beside Search after startup retries; "
+                "call button was not attached"
+            )
+            self._toolbar_retry_id = None
+            return False
+        return True
+
+    def _schedule_toolbar_attach(self) -> None:
+        self._cancel_toolbar_retry()
+        # Gajim can create MessageActionsBox before the visible conversation
+        # header after a cold restart. Retry for up to ~10 seconds instead of
+        # losing the button for the whole app session.
+        if self._attach_toolbar_control():
+            self._toolbar_retry_id = GLib.timeout_add(250, self._attach_toolbar_control)
+
     def _remove_toolbar_control(self) -> None:
+        self._cancel_toolbar_retry()
         entry = self._toolbar_entry
         self._toolbar_entry = None
         if entry is None:
@@ -130,9 +199,10 @@ class GajimCallsPlugin(GajimPlugin):
         _message_actions_box, _container, button = entry
         self._detach(button)
 
-    def set_call_active(self, active: bool) -> None:
-        """Swap the chat-toolbar action between call and hang-up states."""
+    def set_call_active(self, active: bool, *, connected: bool = False) -> None:
+        """Swap the chat-toolbar action between call, cancel, and hang-up states."""
         self._call_active = active
+        self._call_connected = active and connected
         if self._toolbar_entry is None:
             return
 
@@ -142,7 +212,19 @@ class GajimCallsPlugin(GajimPlugin):
             image.set_from_icon_name(
                 "call-stop-symbolic" if active else "call-start-symbolic"
             )
-        button.set_tooltip_text("Hang up" if active else "Start audio call")
+            image.remove_css_class("gajim-calls-mirrored-phone")
+            if not active:
+                # The theme's phone handset points the opposite way from the
+                # requested UI, so mirror only the start-call icon.
+                image.add_css_class("gajim-calls-mirrored-phone")
+
+        if not active:
+            tooltip = "Start audio call"
+        elif connected:
+            tooltip = "Hang up"
+        else:
+            tooltip = "Cancel call"
+        button.set_tooltip_text(tooltip)
         button.remove_css_class("destructive-action")
         if active:
             button.add_css_class("destructive-action")
@@ -151,12 +233,16 @@ class GajimCallsPlugin(GajimPlugin):
     def _message_actions_box_created(
         self, message_actions_box: MessageActionsBox, action_box: Gtk.Box
     ) -> None:
-        # MessageActionsBox is still the supported plugin hook for tracking the
-        # active chat. The visible action is placed beside Search/Chat Details.
+        # A new active conversation can replace the old MessageActionsBox. Move
+        # the single call control to the current conversation instead of keeping
+        # a stale button bound to the prior chat.
         if self._toolbar_entry is not None:
-            return
+            self._remove_toolbar_control()
 
-        call_button = Gtk.Button.new_from_icon_name("call-start-symbolic")
+        image = Gtk.Image.new_from_icon_name("call-start-symbolic")
+        image.add_css_class("gajim-calls-mirrored-phone")
+        call_button = Gtk.Button()
+        call_button.set_child(image)
         call_button.set_tooltip_text("Start audio call")
         call_button.add_css_class("flat")
         call_button.connect(
@@ -164,22 +250,9 @@ class GajimCallsPlugin(GajimPlugin):
             lambda _button: self._on_call_button_clicked(message_actions_box),
         )
 
-        toolbar, anchor = self._find_chat_toolbar_target()
-        if toolbar is not None and hasattr(toolbar, "insert_child_after"):
-            toolbar.insert_child_after(call_button, anchor)
-            container: Gtk.Widget = toolbar
-        else:
-            # Do not put the control back beside the text input. If Gajim's
-            # toolbar cannot be found, leave a clear log entry rather than
-            # recreating the old composer placement the plugin is replacing.
-            log.error(
-                "Could not find chat toolbar beside Search and Chat Details; "
-                "call button was not attached"
-            )
-            container = action_box
-
-        self._toolbar_entry = (message_actions_box, container, call_button)
-        self.set_call_active(self._call_active)
+        self._toolbar_entry = (message_actions_box, action_box, call_button)
+        self.set_call_active(self._call_active, connected=self._call_connected)
+        self._schedule_toolbar_attach()
 
     def _message_actions_box_destroyed(
         self, message_actions_box: MessageActionsBox, _action_box: Gtk.Box
@@ -211,5 +284,5 @@ class GajimCallsPlugin(GajimPlugin):
 
         # Video calling remains implemented internally, but the video button is
         # intentionally hidden until the planned video-call feature is ready.
-        self.set_call_active(True)
+        self.set_call_active(True, connected=False)
         self.controller.start_outgoing(contact.account, contact.jid, video=False)

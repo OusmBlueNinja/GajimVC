@@ -35,9 +35,6 @@ class CallWindow(Gtk.ApplicationWindow):
         self.set_title("Gajim Call")
         self.set_default_size(720, 560)
         self.set_resizable(True)
-
-        # A call is a first-class app window, never a modal popup. This avoids
-        # blocking Gajim on Windows while media negotiation is running.
         self.set_modal(False)
         self.set_hide_on_close(True)
         self.set_destroy_with_parent(False)
@@ -45,7 +42,6 @@ class CallWindow(Gtk.ApplicationWindow):
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self.set_child(root)
 
-        # Compact identity strip, similar to a voice-channel/call header.
         header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         header.set_margin_top(14)
         header.set_margin_bottom(14)
@@ -75,11 +71,8 @@ class CallWindow(Gtk.ApplicationWindow):
         self._header_status.add_css_class("dim-label")
         header.append(self._header_status)
 
-        separator = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
-        root.append(separator)
+        root.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
 
-        # The center stage cross-fades between the contact identity and remote
-        # video. Audio calls stay on the large avatar, like Discord DMs.
         self._stage = Gtk.Stack()
         self._stage.set_hexpand(True)
         self._stage.set_vexpand(True)
@@ -118,7 +111,6 @@ class CallWindow(Gtk.ApplicationWindow):
 
         video_overlay = Gtk.Overlay()
         self._stage.add_named(video_overlay, "video")
-
         self._video = Gtk.Picture()
         self._video.set_hexpand(True)
         self._video.set_vexpand(True)
@@ -136,13 +128,11 @@ class CallWindow(Gtk.ApplicationWindow):
         self._video_name = Gtk.Label(xalign=0)
         self._video_name.add_css_class("title-4")
         video_info.append(self._video_name)
-
         self._video_status = Gtk.Label(xalign=0)
         self._video_status.add_css_class("dim-label")
         video_info.append(self._video_status)
 
-        bottom_separator = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
-        root.append(bottom_separator)
+        root.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
 
         controls_wrap = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         controls_wrap.set_margin_top(16)
@@ -178,7 +168,7 @@ class CallWindow(Gtk.ApplicationWindow):
         controls_wrap.append(self._active_controls)
 
         self._hangup = self._control_button(
-            "call-stop-symbolic", "Hang up", "destructive-action"
+            "call-stop-symbolic", "Cancel call", "destructive-action"
         )
         self._hangup.connect("clicked", self._on_hangup)
         self._active_controls.append(self._hangup)
@@ -198,12 +188,9 @@ class CallWindow(Gtk.ApplicationWindow):
 
     @staticmethod
     def _queue(callback) -> None:
-        """Finish the current GTK event/frame before doing call work."""
-
         def invoke():
             callback()
             return GLib.SOURCE_REMOVE
-
         GLib.idle_add(invoke)
 
     def _set_buttons_sensitive(self, sensitive: bool) -> None:
@@ -223,7 +210,6 @@ class CallWindow(Gtk.ApplicationWindow):
     def _set_peer(self, peer: str) -> None:
         display_name = peer
         self._set_default_avatar()
-
         try:
             context = self._controller.context
             if context is not None:
@@ -241,8 +227,6 @@ class CallWindow(Gtk.ApplicationWindow):
                         contact.get_avatar(AvatarSize.CALL_BIG, scale, add_show=False)
                     )
         except Exception:
-            # Calls must remain usable even when avatar/contact metadata is
-            # temporarily unavailable (for example during roster refresh).
             pass
 
         self.set_title(f"Call with {display_name}")
@@ -253,13 +237,14 @@ class CallWindow(Gtk.ApplicationWindow):
 
     def _prepare_show(self, peer: str, video: bool) -> None:
         self._set_buttons_sensitive(True)
+        self._hangup.set_tooltip_text("Cancel call")
         self._failure_dialog_shown = False
         self._remote_paintable = None
         self._video.set_paintable(None)
         self._stage.set_visible_child_name("identity")
         self._set_peer(peer)
         self._call_kind.set_text("Video call" if video else "Audio call")
-        self._controller.plugin.set_call_active(True)
+        self._controller.plugin.set_call_active(True, connected=False)
 
     @staticmethod
     def _friendly_failure(reason: str) -> str:
@@ -283,7 +268,6 @@ class CallWindow(Gtk.ApplicationWindow):
         if context is None:
             log.error("Call media failure reason=%s", reason)
             return
-
         log.error(
             "Call media failure peer=%s sid=%s state=%s media=%s stun=%s turn=%s reason=%s",
             context.peer_bare,
@@ -296,13 +280,13 @@ class CallWindow(Gtk.ApplicationWindow):
         )
 
     def _on_accept(self, _button) -> None:
-        # Update the UI first. controller.accept() can kick off device/media
-        # negotiation, so never make the click handler wait before GTK repaints.
         self._incoming_controls.set_visible(False)
         self._active_controls.set_visible(True)
-        self._set_buttons_sensitive(False)
+        self._set_buttons_sensitive(True)
+        self._hangup.set_sensitive(True)
+        self._hangup.set_tooltip_text("Cancel call")
         self._set_status_text("Connecting…")
-        self._controller.plugin.set_call_active(True)
+        self._controller.plugin.set_call_active(True, connected=False)
         self._queue(self._controller.accept)
 
     def _on_decline(self, _button) -> None:
@@ -313,12 +297,11 @@ class CallWindow(Gtk.ApplicationWindow):
 
     def _on_hangup(self, _button) -> None:
         self._set_buttons_sensitive(False)
-        self._set_status_text("Ending call…")
+        self._set_status_text("Cancelling…")
         self._controller.plugin.set_call_active(False)
         self._queue(self._controller.hangup)
 
     def _on_close(self, _window) -> bool:
-        # Hide immediately; media teardown happens asynchronously.
         self.set_visible(False)
         self._controller.plugin.set_call_active(False)
         self._queue(self._controller.hangup)
@@ -353,23 +336,22 @@ class CallWindow(Gtk.ApplicationWindow):
             return
 
         self._set_status_text(text)
-        if text.startswith("Connecting"):
+        if text.startswith(("Connecting", "Ringing", "Calling")):
             self._incoming_controls.set_visible(False)
             self._active_controls.set_visible(True)
             self._hangup.set_sensitive(True)
-            self._controller.plugin.set_call_active(True)
+            self._hangup.set_tooltip_text("Cancel call")
+            self._controller.plugin.set_call_active(True, connected=False)
         elif text in {"Call declined", "Call ended"}:
             self._controller.plugin.set_call_active(False)
             self._set_buttons_sensitive(True)
 
     def connected(self, video: bool) -> None:
-        # Once the media path is live, the conversation toolbar becomes the
-        # active-call surface. The ringing/connecting window should disappear.
-        self._controller.plugin.set_call_active(True)
+        self._hangup.set_tooltip_text("Hang up")
+        self._controller.plugin.set_call_active(True, connected=True)
         self.close_call()
 
     def set_remote_paintable(self, paintable) -> None:
-        # media_engine guarantees this method is called from GLib's main loop.
         self._remote_paintable = paintable
         self._video.set_paintable(paintable)
         self._stage.set_visible_child_name("video")

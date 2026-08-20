@@ -6,7 +6,13 @@ import types
 
 from gajim_calls.call_waiting import with_call_waiting
 from gajim_calls.protocol import JMIEvent, JingleEvent
-from gajim_calls.sdp import Codec, Fingerprint, MediaSection, SessionDescription
+from gajim_calls.sdp import (
+    Codec,
+    Fingerprint,
+    IceCandidate,
+    MediaSection,
+    SessionDescription,
+)
 from gajim_calls.state import CallContext, CallState
 
 
@@ -104,6 +110,29 @@ def description() -> SessionDescription:
     )
 
 
+def candidate_event(sid: str, peer: str) -> JingleEvent:
+    candidate = IceCandidate(
+        "1", 1, "udp", 2130706431, "10.0.0.2", 50000, "host"
+    )
+    return JingleEvent(
+        action="transport-info",
+        sid=sid,
+        initiator=peer,
+        responder="me@example.test/Gajim",
+        description=SessionDescription(
+            media=[
+                MediaSection(
+                    media="audio",
+                    mid="audio",
+                    ice_ufrag="ufrag",
+                    ice_pwd="abcdefghijklmnopqrstuv",
+                    candidates=[candidate],
+                )
+            ]
+        ),
+    )
+
+
 def runtime_base(monkeypatch):
     nbxmpp = types.ModuleType("nbxmpp")
     protocol = types.ModuleType("nbxmpp.protocol")
@@ -131,6 +160,7 @@ def runtime_base(monkeypatch):
             self.window = Window()
             self.module = Module()
             self.cancelled_timeouts = 0
+            self.armed_timeouts: list[str] = []
             self.media_starts: list[tuple[bool, SessionDescription | None]] = []
 
         def _module(self, account: str):
@@ -150,6 +180,9 @@ def runtime_base(monkeypatch):
         def _cancel_phase_timeout(self) -> None:
             self.cancelled_timeouts += 1
 
+        def _arm_phase_timeout(self, phase: str) -> None:
+            self.armed_timeouts.append(phase)
+
         def accepts_jingle_sender(self, account, sid, sender, action) -> bool:
             context = self.context
             return (
@@ -167,14 +200,17 @@ def runtime_base(monkeypatch):
         ) -> None:
             self.media_starts.append((offerer, remote_offer))
             self.media = Media()
+            if self.context is not None:
+                self._early_remote_candidates.flush_to(self.media, self.context.sid)
 
         def _finish_local(self, state: CallState, *, hide: bool = True) -> None:
+            context = self.context
             if self.media is not None:
                 self.media.close()
                 self.media = None
-            if self.context is not None:
-                self.context.state = state
-            self._early_remote_candidates.clear()
+            if context is not None:
+                context.state = state
+                self._early_remote_candidates.discard(context.sid)
             if hide:
                 self.window.close_call()
 
@@ -225,6 +261,8 @@ def test_jmi_call_waits_while_existing_call_stays_connected(monkeypatch):
     assert controller.module.jmi[-1]["action"] == "ringing"
     assert controller.plugin.started[-1][1] == "waiting"
     assert controller.window.incoming[-1] == ("second@example.test", False)
+    assert controller.plugin.active[-1] == (True, True)
+    assert controller._waiting_timeout_sid == "waiting"
 
 
 def test_accepting_waiting_call_ends_current_then_promotes_waiting(monkeypatch):
@@ -275,6 +313,7 @@ def test_declining_waiting_call_keeps_current_media_and_state(monkeypatch):
     assert controller.module.jmi[-1]["action"] == "reject"
     assert controller.module.jmi[-1]["sid"] == "waiting"
     assert controller.module.jmi[-1]["reason"] == "busy"
+    assert controller.plugin.active[-1] == (True, True)
 
 
 def test_direct_jingle_waiting_offer_is_owned_and_preserved(monkeypatch):
@@ -302,6 +341,27 @@ def test_direct_jingle_waiting_offer_is_owned_and_preserved(monkeypatch):
     assert controller.media_starts[-1] == (False, offer)
 
 
+def test_waiting_direct_jingle_early_ice_is_flushed_after_accept(monkeypatch):
+    controller = connected_controller(monkeypatch)
+    peer = "second@example.test/Phone"
+    offer = description()
+    controller.handle_jingle(
+        "acc",
+        peer,
+        JingleEvent("session-initiate", "direct-waiting", peer, None, offer),
+    )
+    controller.handle_jingle(
+        "acc", peer, candidate_event("direct-waiting", peer)
+    )
+    assert controller._early_remote_candidates.count("direct-waiting") == 1
+
+    controller.accept()
+
+    assert controller.media is not None
+    assert len(controller.media.candidates) == 1
+    assert controller._early_remote_candidates.count("direct-waiting") == 0
+
+
 def test_third_incoming_call_is_rejected_busy(monkeypatch):
     controller = connected_controller(monkeypatch)
     controller.handle_jmi(
@@ -321,3 +381,64 @@ def test_third_incoming_call_is_rejected_busy(monkeypatch):
     assert controller.module.jmi[-1]["action"] == "reject"
     assert controller.module.jmi[-1]["sid"] == "third"
     assert controller.module.jmi[-1]["reason"] == "busy"
+
+
+def test_direct_call_during_negotiation_is_rejected_not_queued(monkeypatch):
+    controller = connected_controller(monkeypatch)
+    controller.context.state = CallState.NEGOTIATING
+    old_context = controller.context
+    old_media = controller.media
+    peer = "second@example.test/Phone"
+
+    controller.handle_jingle(
+        "acc",
+        peer,
+        JingleEvent("session-initiate", "other", peer, None, description()),
+    )
+
+    assert controller.context is old_context
+    assert controller.media is old_media
+    assert controller.waiting_context is None
+    assert controller.module.jingle[-1]["action"] == "session-terminate"
+    assert controller.module.jingle[-1]["sid"] == "other"
+    assert controller.module.jingle[-1]["reason"] == "busy"
+
+
+def test_waiting_timeout_rejects_waiting_only(monkeypatch):
+    controller = connected_controller(monkeypatch)
+    old_context = controller.context
+    old_media = controller.media
+    controller.handle_jmi(
+        "acc",
+        "second@example.test/Phone",
+        JMIEvent("propose", "waiting", media=("audio",)),
+    )
+
+    assert controller._on_waiting_timeout("waiting") is False
+
+    assert controller.context is old_context
+    assert controller.context is not None
+    assert controller.context.state is CallState.CONNECTED
+    assert controller.media is old_media
+    assert old_media is not None and not old_media.closed
+    assert controller.waiting_context is None
+    assert controller.module.jmi[-1]["action"] == "reject"
+    assert controller.module.jmi[-1]["sid"] == "waiting"
+    assert controller.module.jmi[-1]["reason"] == "timeout"
+    assert controller.plugin.active[-1] == (True, True)
+
+
+def test_active_call_ending_promotes_waiting_call_to_normal_ringing(monkeypatch):
+    controller = connected_controller(monkeypatch)
+    peer = "second@example.test/Phone"
+    controller.handle_jmi(
+        "acc", peer, JMIEvent("propose", "waiting", media=("audio",))
+    )
+
+    controller._finish_local(CallState.ENDED)
+
+    assert controller.context is not None
+    assert controller.context.sid == "waiting"
+    assert controller.context.state is CallState.RINGING
+    assert controller.waiting_context is None
+    assert controller.armed_timeouts[-1] == "ringing"

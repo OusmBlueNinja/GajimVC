@@ -6,6 +6,8 @@ from pathlib import Path
 
 from gi.repository import Gio, Gtk
 
+from ..ringtone import BUILTIN_RINGTONES, DEFAULT_BUILTIN_RINGTONE, normalize_builtin_ringtone
+
 
 class ConfigDialog(Gtk.Window):
     def __init__(self, plugin, transient) -> None:
@@ -14,7 +16,7 @@ class ConfigDialog(Gtk.Window):
         self._ringtone_chooser = None
         self.set_transient_for(transient)
         self.set_modal(True)
-        self.set_default_size(620, 430)
+        self.set_default_size(620, 470)
 
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
         root.set_margin_top(18)
@@ -52,8 +54,7 @@ class ConfigDialog(Gtk.Window):
         self._turn.set_hexpand(True)
         grid.attach(self._turn, 1, 1, 2, 1)
 
-        separator = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
-        root.append(separator)
+        root.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
 
         alert_title = Gtk.Label(label="Incoming calls", xalign=0)
         alert_title.add_css_class("heading")
@@ -74,21 +75,33 @@ class ConfigDialog(Gtk.Window):
         self._ringtone_enabled.set_active(bool(plugin.config["incoming_ringtone"]))
         alerts.attach(self._ringtone_enabled, 1, 1, 1, 1)
 
-        alerts.attach(Gtk.Label(label="Custom ringtone", xalign=0), 0, 2, 1, 1)
+        alerts.attach(Gtk.Label(label="Built-in ringtone", xalign=0), 0, 2, 1, 1)
+        self._ringtone_builtin = Gtk.ComboBoxText()
+        for ringtone_id, label in BUILTIN_RINGTONES:
+            self._ringtone_builtin.append(ringtone_id, label)
+        try:
+            configured = plugin.config["ringtone_builtin"]
+        except Exception:
+            configured = DEFAULT_BUILTIN_RINGTONE
+        self._ringtone_builtin.set_active_id(normalize_builtin_ringtone(configured))
+        alerts.attach(self._ringtone_builtin, 1, 2, 2, 1)
+
+        alerts.attach(Gtk.Label(label="Custom ringtone", xalign=0), 0, 3, 1, 1)
         self._ringtone_path = Gtk.Entry()
         self._ringtone_path.set_hexpand(True)
-        self._ringtone_path.set_placeholder_text("Use bundled default ringtone")
+        self._ringtone_path.set_placeholder_text("Optional audio file; overrides built-in")
         self._ringtone_path.set_text(str(plugin.config["ringtone_path"] or ""))
-        alerts.attach(self._ringtone_path, 1, 2, 1, 1)
+        alerts.attach(self._ringtone_path, 1, 3, 1, 1)
 
         browse = Gtk.Button(label="Browse…")
         browse.connect("clicked", self._choose_ringtone)
-        alerts.attach(browse, 2, 2, 1, 1)
+        alerts.attach(browse, 2, 3, 1, 1)
 
         hint = Gtk.Label(
             label=(
-                "Leave the custom ringtone empty to use the bundled default. "
-                "Notification and ringtone options are independent."
+                "Choose one of the three bundled ringtones, or select a custom audio "
+                "file. A custom file takes priority. Notification and ringtone options "
+                "are independent."
             ),
             wrap=True,
             xalign=0,
@@ -152,5 +165,8 @@ class ConfigDialog(Gtk.Window):
         self._plugin.config["turn_server"] = self._turn.get_text().strip()
         self._plugin.config["incoming_notifications"] = self._notifications.get_active()
         self._plugin.config["incoming_ringtone"] = self._ringtone_enabled.get_active()
+        self._plugin.config["ringtone_builtin"] = (
+            self._ringtone_builtin.get_active_id() or DEFAULT_BUILTIN_RINGTONE
+        )
         self._plugin.config["ringtone_path"] = self._ringtone_path.get_text().strip()
         self.close()

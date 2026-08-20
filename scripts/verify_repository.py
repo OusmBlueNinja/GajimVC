@@ -18,7 +18,15 @@ REQUIRED_MANIFEST_KEYS = {
     "platforms",
     "requirements",
 }
-REQUIRED_PLUGIN_FILES = {"__init__.py", "plugin.py", "plugin-manifest.json"}
+REQUIRED_PLUGIN_FILES = {
+    "__init__.py",
+    "plugin.py",
+    "plugin-manifest.json",
+    "CREDITS.txt",
+    "data/universfield-ringtone-089-496413.ogg.b64",
+    "data/universfield-ringtone-090-496416.ogg.b64",
+    "data/universfield-ringtone-091-496417.ogg.b64",
+}
 
 
 def verify(repository_dir: Path) -> None:
@@ -65,6 +73,8 @@ def verify(repository_dir: Path) -> None:
                     raise SystemExit(
                         f"{package} is missing root files: {sorted(missing_files)}"
                     )
+                if "data/default-ringtone.wav.b64" in names:
+                    raise SystemExit(f"{package} still contains obsolete generated ringtone")
 
                 for name in names:
                     path = PurePosixPath(name)

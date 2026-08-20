@@ -6,6 +6,13 @@ from scripts.build_repository import build
 from scripts.verify_repository import verify
 
 
+RINGTONE_ASSETS = {
+    "data/universfield-ringtone-089-496413.ogg.b64",
+    "data/universfield-ringtone-090-496416.ogg.b64",
+    "data/universfield-ringtone-091-496417.ogg.b64",
+}
+
+
 def test_build_repository_is_gajim_updater_compatible(tmp_path: Path):
     repo = Path(__file__).resolve().parents[1]
     repository_dir = tmp_path / "repository"
@@ -28,7 +35,10 @@ def test_build_repository_is_gajim_updater_compatible(tmp_path: Path):
     assert "version" not in manifest
 
     with zipfile.ZipFile(package) as archive:
-        names = archive.namelist()
+        names = set(archive.namelist())
         assert "plugin-manifest.json" in names
         assert "plugin.py" in names
+        assert "CREDITS.txt" in names
+        assert RINGTONE_ASSETS <= names
+        assert "data/default-ringtone.wav.b64" not in names
         assert not any(name.startswith("gajim_calls/") for name in names)

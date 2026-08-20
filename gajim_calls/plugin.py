@@ -31,6 +31,7 @@ class GajimCallsPlugin(GajimPlugin):
             "turn_server": ("", "GStreamer TURN URI"),
             "incoming_notifications": (True, "Show an incoming-call notification"),
             "incoming_ringtone": (True, "Play a ringtone for incoming calls"),
+            "ringtone_builtin": ("090", "Bundled incoming-call ringtone"),
             "ringtone_path": ("", "Custom incoming-call ringtone path"),
         }
         self.description = "Audio calls using XMPP Jingle and GStreamer WebRTC"
@@ -108,8 +109,6 @@ class GajimCallsPlugin(GajimPlugin):
     def activate(self) -> None:
         log.info("Gajim Calls activated")
         self._schedule_startup_registration()
-        # Recalculate XEP-0115 immediately so already-connected resources expose
-        # this plugin's Jingle features instead of waiting for a future presence.
         self._refresh_caps()
 
     def deactivate(self) -> None:
@@ -118,8 +117,6 @@ class GajimCallsPlugin(GajimPlugin):
         self._cancel_startup_retry()
         self._remove_toolbar_control()
         module.set_controller(None)
-        # Run after the plugin manager finishes removing the update_caps hook,
-        # so contacts no longer see stale call support after disabling plugin.
         GLib.idle_add(self._refresh_caps_idle)
 
     def incoming_call_started(

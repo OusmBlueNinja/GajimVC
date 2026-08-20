@@ -9,6 +9,13 @@ from pathlib import PurePosixPath
 import zipfile
 
 
+RINGTONE_ASSETS = {
+    "gajim_calls/data/universfield-ringtone-089-496413.ogg.b64",
+    "gajim_calls/data/universfield-ringtone-090-496416.ogg.b64",
+    "gajim_calls/data/universfield-ringtone-091-496417.ogg.b64",
+}
+
+
 def verify(path) -> None:
     with zipfile.ZipFile(path) as archive:
         if archive.testzip() is not None:
@@ -26,7 +33,6 @@ def verify(path) -> None:
             if not item.parts:
                 continue
             roots.add(item.parts[0])
-            # Mirrors Gajim 2.4's installer: root-level files are malformed.
             if len(item.parts) == 1 and not name.endswith("/"):
                 raise SystemExit(f"Root-level file is not allowed: {name}")
 
@@ -37,10 +43,14 @@ def verify(path) -> None:
             "gajim_calls/__init__.py",
             "gajim_calls/plugin.py",
             "gajim_calls/plugin-manifest.json",
+            "gajim_calls/CREDITS.txt",
+            *RINGTONE_ASSETS,
         }
         missing = required.difference(names)
         if missing:
             raise SystemExit(f"Missing required files: {sorted(missing)}")
+        if "gajim_calls/data/default-ringtone.wav.b64" in names:
+            raise SystemExit("Obsolete generated default ringtone is still packaged")
 
         manifest = json.loads(
             archive.read("gajim_calls/plugin-manifest.json").decode("utf-8")

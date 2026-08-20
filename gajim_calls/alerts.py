@@ -9,7 +9,7 @@ from gi.repository import Gio, GLib, Gtk
 
 from gajim.common import app
 
-from .ringtone import resolve_ringtone_path
+from .ringtone import DEFAULT_BUILTIN_RINGTONE, resolve_ringtone_path
 
 log = logging.getLogger("gajim.p.gajim_calls.alerts")
 
@@ -56,7 +56,7 @@ class IncomingCallAlerts:
         *,
         video: bool,
     ) -> None:
-        del account  # Reserved for future per-account alert preferences.
+        del account
         if self._sid == sid:
             return
         self.stop()
@@ -93,9 +93,13 @@ class IncomingCallAlerts:
 
     def _start_ringtone(self) -> None:
         custom = str(self._config("ringtone_path", "") or "").strip()
+        builtin = str(
+            self._config("ringtone_builtin", DEFAULT_BUILTIN_RINGTONE)
+            or DEFAULT_BUILTIN_RINGTONE
+        )
         cache_dir = Path(GLib.get_user_cache_dir()) / "gajim-calls"
         try:
-            path = resolve_ringtone_path(custom, cache_dir)
+            path = resolve_ringtone_path(custom, cache_dir, builtin)
             media = Gtk.MediaFile.new_for_filename(str(path))
             media.set_loop(True)
             media.set_volume(1.0)

@@ -1,0 +1,22 @@
+Gajim Calls - Third-Party Credits
+=================================
+
+Built-in ringtones
+------------------
+The bundled ringtones 089, 090, and 091 were created by universfield and
+sourced from Pixabay. The original uploads supplied for this plugin were:
+
+- universfield-ringtone-089-496413.mp3
+- universfield-ringtone-090-496416.mp3
+- universfield-ringtone-091-496417.mp3
+
+The plugin ships size-optimized Opus-in-Ogg conversions of those audio files.
+Ringtone 090 is the default selection. The original audio files are not
+redistributed in the plugin archive.
+
+Source platform: Pixabay (https://pixabay.com/)
+Creator attribution: universfield
+
+The Gajim Calls source code remains licensed under GPL-3.0 as described in the
+repository LICENSE file. Third-party media remains subject to its applicable
+source license/terms.

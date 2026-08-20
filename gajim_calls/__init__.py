@@ -22,12 +22,12 @@ def __getattr__(name: str) -> Any:
         raise AttributeError(name)
 
     from . import plugin as plugin_module
-    from .call_waiting import with_call_waiting
 
-    # Keep call waiting isolated from the core runtime controller. The plugin
-    # class looks this global up when init() runs, so replacing it here keeps
-    # Gajim's discovery surface unchanged while composing the extra behaviour.
-    plugin_module.RuntimeCallController = with_call_waiting(
-        plugin_module.RuntimeCallController
-    )
+    # Discovery tests and lightweight loaders can provide only the plugin
+    # class. Compose runtime-only behaviour when the real controller exists.
+    runtime_controller = getattr(plugin_module, "RuntimeCallController", None)
+    if runtime_controller is not None:
+        from .call_waiting import with_call_waiting
+
+        plugin_module.RuntimeCallController = with_call_waiting(runtime_controller)
     return plugin_module.GajimCallsPlugin

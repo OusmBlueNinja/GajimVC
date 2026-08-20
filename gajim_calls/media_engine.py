@@ -197,7 +197,9 @@ class WebRTCMediaEngine:
             "stun_server": stun_server,
             "turn_server": turn_server,
             "on_local_description": self._local_description_ready,
-            "on_ice_candidate": on_ice_candidate,
+            # webrtcbin/libnice can emit candidates from a GStreamer thread.
+            # Never let that thread enter the controller/Gajim network stack.
+            "on_ice_candidate": self._ice_candidate_ready,
             "on_connected": on_connected,
             "on_failed": on_failed,
             "on_remote_video": on_remote_video,
@@ -205,6 +207,7 @@ class WebRTCMediaEngine:
             "test_mode": test_mode,
         }
         self._user_local_description = on_local_description
+        self._user_ice_candidate = on_ice_candidate
         self._on_failed = on_failed
         self._lock = threading.RLock()
         self._engine: _HardenedWebRTCMediaEngine | None = None
@@ -214,6 +217,21 @@ class WebRTCMediaEngine:
         self._pending_answer: SessionDescription | None = None
         self._pending_candidates: list[tuple[str, str]] = []
         self._mic_enabled: bool | None = None
+
+    def _ice_candidate_ready(self, mid: str, candidate: str) -> None:
+        """Marshal libnice's candidate callback to GLib's main context."""
+        with self._lock:
+            if self._closed:
+                return
+        _idle(self._deliver_ice_candidate, mid, candidate)
+
+    def _deliver_ice_candidate(self, mid: str, candidate: str) -> None:
+        """Deliver a queued candidate only while this media facade is live."""
+        with self._lock:
+            if self._closed:
+                return
+            callback = self._user_ice_candidate
+        callback(mid, candidate)
 
     def _local_description_ready(self, description: SessionDescription) -> None:
         with self._lock:

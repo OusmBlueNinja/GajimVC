@@ -2,7 +2,7 @@
   "authors": [
     "Deauth"
   ],
-  "description": "Audio and video calls for Gajim using XMPP Jingle, ICE, DTLS-SRTP, and GStreamer WebRTC.",
+  "description": "Audio calls for Gajim using XMPP Jingle, ICE, DTLS-SRTP, and GStreamer WebRTC. Video calling is planned.",
   "homepage": "https://dock-it.dev/Deauth/gajim-calls",
   "config_dialog": true,
   "name": "Gajim Calls",
@@ -16,5 +16,5 @@
     "gajim>=2.4.2,<2.6.0"
   ],
   "short_name": "gajim_calls",
-  "version": "0.1.7"
+  "version": "0.1.8"
 }

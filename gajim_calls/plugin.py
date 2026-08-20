@@ -28,9 +28,7 @@ class GajimCallsPlugin(GajimPlugin):
             "stun_server": ("", "GStreamer STUN URI"),
             "turn_server": ("", "GStreamer TURN URI"),
         }
-        self.description = (
-            "Audio and video calls using XMPP Jingle and GStreamer WebRTC"
-        )
+        self.description = "Audio calls using XMPP Jingle and GStreamer WebRTC"
         self.config_dialog = partial(ConfigDialog, self)
 
         # controller.py historically imported the media class directly. Keep
@@ -46,9 +44,10 @@ class GajimCallsPlugin(GajimPlugin):
                 self._message_actions_box_destroyed,
             )
         }
-        self._header_entry: tuple[
-            MessageActionsBox, Gtk.Widget, Gtk.Button, Gtk.Button
+        self._toolbar_entry: tuple[
+            MessageActionsBox, Gtk.Widget, Gtk.Button
         ] | None = None
+        self._call_active = False
 
         ok, reason = probe_runtime()
         if not ok:
@@ -60,7 +59,7 @@ class GajimCallsPlugin(GajimPlugin):
 
     def deactivate(self) -> None:
         self.controller.shutdown()
-        self._remove_header_controls()
+        self._remove_toolbar_control()
         module.set_controller(None)
 
     @staticmethod
@@ -78,34 +77,34 @@ class GajimCallsPlugin(GajimPlugin):
                 child = child.get_next_sibling()
             stack.extend(reversed(children))
 
-    def _find_header_target(self) -> Gtk.Widget | None:
-        """Find Gajim's actual application header without private attributes."""
+    def _find_chat_toolbar_target(self) -> tuple[Gtk.Widget | None, Gtk.Widget | None]:
+        """Find the conversation toolbar containing Search and Chat Details."""
         try:
-            titlebar = app.window.get_titlebar()
+            root = app.window
         except Exception:
-            titlebar = None
+            return None, None
 
-        # Prefer the titlebar subtree. Gajim 2.5 uses libadwaita/GTK header
-        # bars, both of which expose pack_end(). Searching the widget tree keeps
-        # this compatible with the different Windows/Linux header wrappers.
-        roots = [titlebar]
-        try:
-            roots.append(app.window)
-        except Exception:
-            pass
+        search_button: Gtk.Button | None = None
+        details_button: Gtk.Button | None = None
+        for widget in self._walk_widgets(root):
+            if not isinstance(widget, Gtk.Button):
+                continue
+            tooltip = (widget.get_tooltip_text() or "").strip().lower()
+            if search_button is None and tooltip.startswith("search"):
+                search_button = widget
+            if details_button is None and (
+                "chat details" in tooltip or "details and settings" in tooltip
+            ):
+                details_button = widget
 
-        seen: set[int] = set()
-        for root in roots:
-            for widget in self._walk_widgets(root):
-                key = id(widget)
-                if key in seen:
-                    continue
-                seen.add(key)
-                if type(widget).__name__.endswith("HeaderBar") and hasattr(
-                    widget, "pack_end"
-                ):
-                    return widget
-        return None
+        # Gajim 2.5 places Search and Chat Details and Settings in the same
+        # conversation toolbar. Insert immediately after Search so the call
+        # action sits with those chat actions rather than in the window caption.
+        if search_button is not None:
+            return search_button.get_parent(), search_button
+        if details_button is not None:
+            return details_button.get_parent(), details_button
+        return None, None
 
     @staticmethod
     def _detach(widget: Gtk.Widget) -> None:
@@ -123,67 +122,81 @@ class GajimCallsPlugin(GajimPlugin):
         except (AttributeError, TypeError):
             pass
 
-    def _remove_header_controls(self) -> None:
-        entry = self._header_entry
-        self._header_entry = None
+    def _remove_toolbar_control(self) -> None:
+        entry = self._toolbar_entry
+        self._toolbar_entry = None
         if entry is None:
             return
-        _message_actions_box, _container, audio, video = entry
-        self._detach(audio)
-        self._detach(video)
+        _message_actions_box, _container, button = entry
+        self._detach(button)
+
+    def set_call_active(self, active: bool) -> None:
+        """Swap the chat-toolbar action between call and hang-up states."""
+        self._call_active = active
+        if self._toolbar_entry is None:
+            return
+
+        button = self._toolbar_entry[2]
+        image = button.get_child()
+        if isinstance(image, Gtk.Image):
+            image.set_from_icon_name(
+                "call-stop-symbolic" if active else "call-start-symbolic"
+            )
+        button.set_tooltip_text("Hang up" if active else "Start audio call")
+        button.remove_css_class("destructive-action")
+        if active:
+            button.add_css_class("destructive-action")
+        button.set_sensitive(True)
 
     def _message_actions_box_created(
         self, message_actions_box: MessageActionsBox, action_box: Gtk.Box
     ) -> None:
-        # MessageActionsBox is the supported Gajim plugin hook we use to track
-        # the active chat. The buttons themselves belong in the header now.
-        if self._header_entry is not None:
+        # MessageActionsBox is still the supported plugin hook for tracking the
+        # active chat. The visible action is placed beside Search/Chat Details.
+        if self._toolbar_entry is not None:
             return
 
-        audio = Gtk.Button.new_from_icon_name("call-start-symbolic")
-        audio.set_tooltip_text("Start audio call")
-        audio.add_css_class("flat")
-        audio.connect(
+        call_button = Gtk.Button.new_from_icon_name("call-start-symbolic")
+        call_button.set_tooltip_text("Start audio call")
+        call_button.add_css_class("flat")
+        call_button.connect(
             "clicked",
-            lambda _button: self._start_from_box(message_actions_box, video=False),
+            lambda _button: self._on_call_button_clicked(message_actions_box),
         )
 
-        video = Gtk.Button.new_from_icon_name("camera-video-symbolic")
-        video.set_tooltip_text("Start video call")
-        video.add_css_class("flat")
-        video.connect(
-            "clicked",
-            lambda _button: self._start_from_box(message_actions_box, video=True),
-        )
-
-        header = self._find_header_target()
-        if header is not None:
-            # Keep the familiar Discord/modern-messenger placement: call
-            # actions live at the trailing edge of the application header.
-            header.pack_end(video)
-            header.pack_end(audio)
-            container: Gtk.Widget = header
+        toolbar, anchor = self._find_chat_toolbar_target()
+        if toolbar is not None and hasattr(toolbar, "insert_child_after"):
+            toolbar.insert_child_after(call_button, anchor)
+            container: Gtk.Widget = toolbar
         else:
-            # This should only be needed for unusual custom window layouts.
-            # Keeping a fallback is preferable to silently losing call access.
-            log.warning("Could not find Gajim header bar; using message actions fallback")
-            action_box.append(audio)
-            action_box.append(video)
+            # Do not put the control back beside the text input. If Gajim's
+            # toolbar cannot be found, leave a clear log entry rather than
+            # recreating the old composer placement the plugin is replacing.
+            log.error(
+                "Could not find chat toolbar beside Search and Chat Details; "
+                "call button was not attached"
+            )
             container = action_box
 
-        self._header_entry = (message_actions_box, container, audio, video)
+        self._toolbar_entry = (message_actions_box, container, call_button)
+        self.set_call_active(self._call_active)
 
     def _message_actions_box_destroyed(
         self, message_actions_box: MessageActionsBox, _action_box: Gtk.Box
     ) -> None:
-        entry = self._header_entry
+        entry = self._toolbar_entry
         if entry is None or entry[0] is not message_actions_box:
             return
-        self._remove_header_controls()
+        self._remove_toolbar_control()
 
-    def _start_from_box(
-        self, message_actions_box: MessageActionsBox, *, video: bool
-    ) -> None:
+    def _on_call_button_clicked(self, message_actions_box: MessageActionsBox) -> None:
+        if self._call_active:
+            self.set_call_active(False)
+            self.controller.hangup()
+            return
+        self._start_from_box(message_actions_box)
+
+    def _start_from_box(self, message_actions_box: MessageActionsBox) -> None:
         try:
             contact = message_actions_box.get_current_contact()
         except Exception:
@@ -196,4 +209,7 @@ class GajimCallsPlugin(GajimPlugin):
             )
             return
 
-        self.controller.start_outgoing(contact.account, contact.jid, video=video)
+        # Video calling remains implemented internally, but the video button is
+        # intentionally hidden until the planned video-call feature is ready.
+        self.set_call_active(True)
+        self.controller.start_outgoing(contact.account, contact.jid, video=False)

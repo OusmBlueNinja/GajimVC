@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import logging
+
 from gi.repository import GLib, Gtk
 from nbxmpp.protocol import JID
 
 from gajim.common import app
 from gajim.common.const import AvatarSize
 from gajim.common.modules.contacts import BareContact
+from gajim.gtk.alert import InformationAlertDialog
+
+log = logging.getLogger("gajim.p.gajim_calls.call_window")
 
 
 class CallWindow(Gtk.ApplicationWindow):
@@ -26,6 +31,7 @@ class CallWindow(Gtk.ApplicationWindow):
 
         self._controller = controller
         self._remote_paintable = None
+        self._failure_dialog_shown = False
         self.set_title("Gajim Call")
         self.set_default_size(720, 560)
         self.set_resizable(True)
@@ -229,14 +235,10 @@ class CallWindow(Gtk.ApplicationWindow):
                     display_name = contact.name
                     scale = self.get_scale_factor()
                     self._mini_avatar.set_from_paintable(
-                        contact.get_avatar(
-                            AvatarSize.CHAT, scale, add_show=False
-                        )
+                        contact.get_avatar(AvatarSize.CHAT, scale, add_show=False)
                     )
                     self._avatar.set_from_paintable(
-                        contact.get_avatar(
-                            AvatarSize.CALL_BIG, scale, add_show=False
-                        )
+                        contact.get_avatar(AvatarSize.CALL_BIG, scale, add_show=False)
                     )
         except Exception:
             # Calls must remain usable even when avatar/contact metadata is
@@ -251,11 +253,47 @@ class CallWindow(Gtk.ApplicationWindow):
 
     def _prepare_show(self, peer: str, video: bool) -> None:
         self._set_buttons_sensitive(True)
+        self._failure_dialog_shown = False
         self._remote_paintable = None
         self._video.set_paintable(None)
         self._stage.set_visible_child_name("identity")
         self._set_peer(peer)
         self._call_kind.set_text("Video call" if video else "Audio call")
+        self._controller.plugin.set_call_active(True)
+
+    @staticmethod
+    def _friendly_failure(reason: str) -> str:
+        if "ICE connectivity checks failed" in reason:
+            if "STUN=no" in reason and "TURN=no" in reason:
+                return (
+                    "A direct media connection could not be established, and no "
+                    "STUN or TURN server is configured. Configure STUN/TURN in "
+                    "Gajim Calls settings or try a network that allows direct "
+                    "peer-to-peer traffic."
+                )
+            return (
+                "A media connection could not be established between the two "
+                "devices. Try another network or configure a TURN server."
+            )
+        return "The call could not be connected. Check the Gajim log for technical details."
+
+    def _log_failure(self, reason: str) -> None:
+        context = self._controller.context
+        plugin = self._controller.plugin
+        if context is None:
+            log.error("Call media failure reason=%s", reason)
+            return
+
+        log.error(
+            "Call media failure peer=%s sid=%s state=%s media=%s stun=%s turn=%s reason=%s",
+            context.peer_bare,
+            context.sid,
+            getattr(context.state, "value", context.state),
+            ",".join(context.media),
+            "configured" if plugin.config["stun_server"] else "not-configured",
+            "configured" if plugin.config["turn_server"] else "not-configured",
+            reason,
+        )
 
     def _on_accept(self, _button) -> None:
         # Update the UI first. controller.accept() can kick off device/media
@@ -264,21 +302,25 @@ class CallWindow(Gtk.ApplicationWindow):
         self._active_controls.set_visible(True)
         self._set_buttons_sensitive(False)
         self._set_status_text("Connecting…")
+        self._controller.plugin.set_call_active(True)
         self._queue(self._controller.accept)
 
     def _on_decline(self, _button) -> None:
         self._set_buttons_sensitive(False)
         self._set_status_text("Declining…")
+        self._controller.plugin.set_call_active(False)
         self._queue(self._controller.decline)
 
     def _on_hangup(self, _button) -> None:
         self._set_buttons_sensitive(False)
         self._set_status_text("Ending call…")
+        self._controller.plugin.set_call_active(False)
         self._queue(self._controller.hangup)
 
     def _on_close(self, _window) -> bool:
         # Hide immediately; media teardown happens asynchronously.
         self.set_visible(False)
+        self._controller.plugin.set_call_active(False)
         self._queue(self._controller.hangup)
         return True
 
@@ -297,21 +339,34 @@ class CallWindow(Gtk.ApplicationWindow):
         self.present()
 
     def set_status(self, text: str) -> None:
+        if text.startswith("Call failed"):
+            reason = text.partition(":")[2].strip() or text
+            self._log_failure(reason)
+            self._controller.plugin.set_call_active(False)
+            self.close_call()
+            if not self._failure_dialog_shown:
+                self._failure_dialog_shown = True
+                InformationAlertDialog(
+                    "Call failed",
+                    f"{self._friendly_failure(reason)}\n\nTechnical details were written to the Gajim log.",
+                )
+            return
+
         self._set_status_text(text)
         if text.startswith("Connecting"):
             self._incoming_controls.set_visible(False)
             self._active_controls.set_visible(True)
             self._hangup.set_sensitive(True)
-        elif text.startswith("Call failed") or text in {"Call declined", "Call ended"}:
+            self._controller.plugin.set_call_active(True)
+        elif text in {"Call declined", "Call ended"}:
+            self._controller.plugin.set_call_active(False)
             self._set_buttons_sensitive(True)
 
     def connected(self, video: bool) -> None:
-        self._set_status_text("Connected")
-        self._incoming_controls.set_visible(False)
-        self._active_controls.set_visible(True)
-        self._hangup.set_sensitive(True)
-        if not video or self._remote_paintable is None:
-            self._stage.set_visible_child_name("identity")
+        # Once the media path is live, the conversation toolbar becomes the
+        # active-call surface. The ringing/connecting window should disappear.
+        self._controller.plugin.set_call_active(True)
+        self.close_call()
 
     def set_remote_paintable(self, paintable) -> None:
         # media_engine guarantees this method is called from GLib's main loop.

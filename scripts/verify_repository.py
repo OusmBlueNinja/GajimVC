@@ -18,15 +18,24 @@ REQUIRED_MANIFEST_KEYS = {
     "platforms",
     "requirements",
 }
-REQUIRED_PLUGIN_FILES = {
+CORE_PLUGIN_FILES = {
     "__init__.py",
     "plugin.py",
     "plugin-manifest.json",
+}
+CURRENT_PLUGIN_FILES = {
     "CREDITS.txt",
     "data/universfield-ringtone-089-496413.ogg.b64",
     "data/universfield-ringtone-090-496416.ogg.b64",
     "data/universfield-ringtone-091-496417.ogg.b64",
 }
+
+
+def _version_key(version: str) -> tuple[int, ...]:
+    try:
+        return tuple(int(part) for part in str(version).split("."))
+    except ValueError as error:
+        raise SystemExit(f"Unsupported plugin version format: {version!r}") from error
 
 
 def verify(repository_dir: Path) -> None:
@@ -53,6 +62,8 @@ def verify(repository_dir: Path) -> None:
     for short_name, versions in plugins.items():
         if not isinstance(versions, dict) or not versions:
             raise SystemExit(f"No versions listed for {short_name}")
+
+        current_version = max(versions, key=_version_key)
         for version, indexed_manifest in versions.items():
             missing = REQUIRED_MANIFEST_KEYS.difference(indexed_manifest)
             if missing:
@@ -68,12 +79,15 @@ def verify(repository_dir: Path) -> None:
                 if archive.testzip() is not None:
                     raise SystemExit(f"CRC check failed: {package}")
                 names = set(archive.namelist())
-                missing_files = REQUIRED_PLUGIN_FILES.difference(names)
+                required_files = set(CORE_PLUGIN_FILES)
+                if version == current_version:
+                    required_files.update(CURRENT_PLUGIN_FILES)
+                missing_files = required_files.difference(names)
                 if missing_files:
                     raise SystemExit(
                         f"{package} is missing root files: {sorted(missing_files)}"
                     )
-                if "data/default-ringtone.wav.b64" in names:
+                if version == current_version and "data/default-ringtone.wav.b64" in names:
                     raise SystemExit(f"{package} still contains obsolete generated ringtone")
 
                 for name in names:
